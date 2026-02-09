@@ -1,0 +1,458 @@
+import torch
+import torch.nn as nn
+import pandas as pd
+import numpy as np
+import cv2
+from PIL import Image
+import os
+from torch.utils.data import Dataset, DataLoader
+from torchvision import models
+from tqdm import tqdm
+import json
+import warnings
+warnings.filterwarnings('ignore')
+
+# Set device
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+print(f"Using device: {device}")
+
+class DRGBChannelClassifier(nn.Module):
+    """
+    Diabetic Retinopathy Classifier for GB (Green-Blue) channels
+    """
+    def __init__(self, num_classes=5, pretrained=False, dropout_rate=0.5):
+        super(DRGBChannelClassifier, self).__init__()
+        
+        # Use ResNet50 as backbone
+        self.backbone = models.resnet50(pretrained=pretrained)
+        
+        # Modify first conv layer for 2 input channels (GB)
+        original_conv1 = self.backbone.conv1
+        
+        # Create new conv1 layer with 2 input channels
+        self.backbone.conv1 = nn.Conv2d(
+            2, 64, kernel_size=7, stride=2, padding=3, bias=False
+        )
+        
+        # Initialize new conv1 weights
+        if pretrained:
+            with torch.no_grad():
+                # Use Green and Blue weights from pretrained model
+                self.backbone.conv1.weight[:, 0:1, :, :] = original_conv1.weight[:, 1:2, :, :]  # Green channel
+                self.backbone.conv1.weight[:, 1:2, :, :] = original_conv1.weight[:, 2:3, :, :]  # Blue channel
+        else:
+            nn.init.kaiming_normal_(self.backbone.conv1.weight, mode='fan_out', nonlinearity='relu')
+        
+        # Store original fc layer input features
+        num_features = self.backbone.fc.in_features
+        
+        # Replace final layer with custom classifier
+        self.backbone.fc = nn.Sequential(
+            nn.Dropout(dropout_rate),
+            nn.Linear(num_features, 512),
+            nn.ReLU(inplace=True),
+            nn.Dropout(dropout_rate/2),
+            nn.Linear(512, 256),
+            nn.ReLU(inplace=True),
+            nn.Dropout(dropout_rate/4),
+            nn.Linear(256, num_classes)
+        )
+        
+        # Initialize weights for new layers
+        for m in self.backbone.fc.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight)
+                nn.init.constant_(m.bias, 0)
+        
+    def forward(self, x):
+        return self.backbone(x)
+
+class GBTransforms:
+    """
+    Custom transforms for GB (2-channel) images
+    """
+    def __init__(self, size=(512, 512), mean=None, std=None):
+        self.size = size
+        self.mean = mean or [0.5, 0.5]
+        self.std = std or [0.5, 0.5]
+        
+    def __call__(self, tensor):
+        # tensor shape: (2, H, W)
+        
+        # Resize
+        tensor = torch.nn.functional.interpolate(
+            tensor.unsqueeze(0), 
+            size=self.size, 
+            mode='bilinear', 
+            align_corners=False
+        ).squeeze(0)
+        
+        # Normalize - Apply channel-specific normalization
+        for i in range(2):
+            tensor[i] = (tensor[i] - self.mean[i]) / self.std[i]
+            
+        return tensor
+
+class TestDatasetGB(Dataset):
+    """
+    Test Dataset for GB (Green-Blue) channels
+    """
+    def __init__(self, test_dir, transform=None):
+        self.test_dir = test_dir
+        self.transform = transform
+        
+        # Get all image files in test directory
+        self.image_files = []
+        if os.path.exists(test_dir):
+            for file in os.listdir(test_dir):
+                if file.lower().endswith(('.png', '.jpg', '.jpeg')):
+                    self.image_files.append(file)
+        
+        self.image_files.sort()  # Ensure consistent ordering
+        print(f"Found {len(self.image_files)} test images")
+        
+        if len(self.image_files) == 0:
+            print(f"Warning: No images found in {test_dir}")
+    
+    def __len__(self):
+        return len(self.image_files)
+    
+    def __getitem__(self, idx):
+        img_file = self.image_files[idx]
+        img_path = os.path.join(self.test_dir, img_file)
+        
+        # Get image name without extension for submission
+        img_name = os.path.splitext(img_file)[0]
+        
+        try:
+            # Load image
+            image = cv2.imread(img_path)
+            if image is None:
+                raise ValueError(f"Could not load image: {img_path}")
+            
+            # Convert BGR to RGB
+            image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+            
+            # Extract Green and Blue channels only
+            image_gb = np.zeros((image_rgb.shape[0], image_rgb.shape[1], 2), dtype=np.uint8)
+            image_gb[:, :, 0] = image_rgb[:, :, 1]  # Green channel
+            image_gb[:, :, 1] = image_rgb[:, :, 2]  # Blue channel
+            
+            # Convert to tensor format
+            image_tensor = torch.from_numpy(image_gb).permute(2, 0, 1).float() / 255.0
+            
+            if self.transform:
+                image_tensor = self.transform(image_tensor)
+                
+        except Exception as e:
+            print(f"Error loading image {img_file}: {e}")
+            # Return a dummy tensor in case of error
+            image_tensor = torch.zeros((2, 512, 512), dtype=torch.float32)
+            
+        return image_tensor, img_name
+
+def load_model_and_stats(model_path):
+    """
+    Load the trained model and get normalization statistics
+    """
+    print(f"Loading model from: {model_path}")
+    
+    if not os.path.exists(model_path):
+        raise FileNotFoundError(f"Model file not found: {model_path}")
+    
+    # Load checkpoint
+    checkpoint = torch.load(model_path, map_location=device ,weights_only=False)
+    
+    # Initialize model
+    model = DRGBChannelClassifier(num_classes=5, dropout_rate=0.5)
+    model.load_state_dict(checkpoint['model_state_dict'])
+    model.to(device)
+    model.eval()
+    
+    print(f"Model loaded successfully!")
+    print(f"Best QWK from training: {checkpoint.get('best_kappa', 'N/A')}")
+    print(f"Training epoch: {checkpoint.get('epoch', 'N/A')}")
+    
+    # Try to load normalization stats
+    gb_mean = [0.2244939843137255, 0.07592454901960785]  # Default from training
+    gb_std = [0.14950096306753813, 0.1]
+    
+    # Try to load from JSON file if available
+    stats_file = 'gb_normalization_stats.json'
+    if os.path.exists(stats_file):
+        try:
+            with open(stats_file, 'r') as f:
+                stats = json.load(f)
+                gb_mean = stats['gb_mean']
+                gb_std = stats['gb_std']
+            print(f"Loaded normalization stats from {stats_file}")
+        except:
+            print("Using default normalization stats from training")
+    else:
+        print("Using default normalization stats from training")
+    
+    print(f"GB Normalization - Mean: {gb_mean}, Std: {gb_std}")
+    
+    return model, gb_mean, gb_std
+
+def predict_test_set(model, test_loader, use_tta=True):
+    """
+    Generate predictions on test set with optional Test Time Augmentation (TTA)
+    """
+    model.eval()
+    all_predictions = []
+    all_image_names = []
+    all_probabilities = []
+    
+    print(f"Generating predictions on {len(test_loader.dataset)} test images...")
+    
+    with torch.no_grad():
+        for batch_idx, (data, image_names) in enumerate(tqdm(test_loader, desc="Predicting")):
+            data = data.to(device)
+            
+            if use_tta:
+                # Test Time Augmentation: original + horizontal flip
+                outputs = model(data)
+                
+                # Horizontal flip
+                data_flipped = torch.flip(data, [-1])
+                outputs_flipped = model(data_flipped)
+                
+                # Average predictions
+                outputs = (outputs + outputs_flipped) / 2
+            else:
+                outputs = model(data)
+            
+            # Get probabilities and predictions
+            probabilities = torch.softmax(outputs, dim=1)
+            predictions = outputs.argmax(dim=1)
+            
+            all_predictions.extend(predictions.cpu().numpy())
+            all_probabilities.extend(probabilities.cpu().numpy())
+            all_image_names.extend(image_names)
+    
+    return all_predictions, all_probabilities, all_image_names
+
+def create_submission(predictions, image_names, output_file='submission.csv'):
+    """
+    Create submission file
+    """
+    # Create submission dataframe
+    submission_df = pd.DataFrame({
+        'id_code': image_names,
+        'diagnosis': predictions
+    })
+    
+    # Sort by id_code to ensure consistent ordering
+    submission_df = submission_df.sort_values('id_code').reset_index(drop=True)
+    
+    # Save submission file
+    submission_df.to_csv(output_file, index=False)
+    
+    print(f"\nSubmission file saved: {output_file}")
+    print(f"Total predictions: {len(submission_df)}")
+    
+    # Display class distribution
+    class_counts = submission_df['diagnosis'].value_counts().sort_index()
+    print("\nPrediction Distribution:")
+    for class_id, count in class_counts.items():
+        percentage = count / len(submission_df) * 100
+        print(f"  Class {class_id}: {count} images ({percentage:.1f}%)")
+    
+    # Display first few predictions
+    print(f"\nFirst 10 predictions:")
+    print(submission_df.head(10).to_string(index=False))
+    
+    return submission_df
+
+def analyze_predictions(probabilities, predictions, image_names):
+    """
+    Analyze prediction confidence and distribution
+    """
+    probabilities = np.array(probabilities)
+    predictions = np.array(predictions)
+    
+    # Calculate confidence scores (max probability)
+    confidence_scores = np.max(probabilities, axis=1)
+    
+    print(f"\nPrediction Analysis:")
+    print(f"Mean confidence: {np.mean(confidence_scores):.4f}")
+    print(f"Median confidence: {np.median(confidence_scores):.4f}")
+    print(f"Min confidence: {np.min(confidence_scores):.4f}")
+    print(f"Max confidence: {np.max(confidence_scores):.4f}")
+    
+    # Find low confidence predictions
+    low_confidence_threshold = 0.5
+    low_conf_indices = np.where(confidence_scores < low_confidence_threshold)[0]
+    
+    if len(low_conf_indices) > 0:
+        print(f"\nLow confidence predictions (< {low_confidence_threshold}):")
+        print(f"Count: {len(low_conf_indices)} ({len(low_conf_indices)/len(predictions)*100:.1f}%)")
+        
+        # Show some examples
+        for i in low_conf_indices[:5]:  # Show first 5
+            print(f"  {image_names[i]}: Class {predictions[i]} (confidence: {confidence_scores[i]:.3f})")
+    
+    return confidence_scores
+
+def main():
+    """
+    Main inference function
+    """
+    print("="*70)
+    print("DIABETIC RETINOPATHY GB CHANNEL MODEL INFERENCE")
+    print("="*70)
+    
+    # Configuration
+    config = {
+        'model_path': '/kaggle/input/diabetic-retinopathy-gb/best_gb_model.pth',
+        'test_dir': '/kaggle/input/aptos2019-blindness-detection/test_images',  # Update path as needed
+        'batch_size': 16,
+        'use_tta': True,  # Test Time Augmentation
+        'output_file': 'submission.csv'
+    }
+    
+    # Load model and normalization stats
+    try:
+        model, gb_mean, gb_std = load_model_and_stats(config['model_path'])
+    except Exception as e:
+        print(f"Error loading model: {e}")
+        return None
+    
+    # Create test transforms
+    test_transform = GBTransforms(
+        size=(512, 512),
+        mean=gb_mean,
+        std=gb_std
+    )
+    
+    # Create test dataset and dataloader
+    test_dataset = TestDatasetGB(
+        config['test_dir'],
+        transform=test_transform
+    )
+    
+    if len(test_dataset) == 0:
+        print("No test images found! Please check the test directory path.")
+        return None
+    
+    test_loader = DataLoader(
+        test_dataset,
+        batch_size=config['batch_size'],
+        shuffle=False,
+        num_workers=2,
+        pin_memory=True
+    )
+    
+    print(f"Test loader created: {len(test_loader)} batches")
+    
+    # Generate predictions
+    predictions, probabilities, image_names = predict_test_set(
+        model, 
+        test_loader, 
+        use_tta=config['use_tta']
+    )
+    
+    # Analyze predictions
+    confidence_scores = analyze_predictions(probabilities, predictions, image_names)
+    
+    # Create submission file
+    submission_df = create_submission(
+        predictions, 
+        image_names, 
+        config['output_file']
+    )
+    
+    # Save detailed results
+    detailed_results = {
+        'image_names': image_names,
+        'predictions': [int(p) for p in predictions],
+        'probabilities': [prob.tolist() for prob in probabilities],
+        'confidence_scores': confidence_scores.tolist()
+    }
+    
+    with open('detailed_predictions.json', 'w') as f:
+        json.dump(detailed_results, f, indent=2)
+    
+    print(f"\nDetailed predictions saved to: 'detailed_predictions.json'")
+    
+    # Summary
+    print(f"\n{'='*70}")
+    print("INFERENCE COMPLETED SUCCESSFULLY")
+    print(f"{'='*70}")
+    print(f"Model: GB Channel (Green-Blue) Diabetic Retinopathy Classifier")
+    print(f"Test images processed: {len(predictions)}")
+    print(f"Submission file: {config['output_file']}")
+    print(f"Test Time Augmentation: {'Enabled' if config['use_tta'] else 'Disabled'}")
+    print(f"Mean prediction confidence: {np.mean(confidence_scores):.4f}")
+    print(f"{'='*70}")
+    
+    return submission_df, detailed_results
+
+# Additional utility functions
+def create_sample_submission_format():
+    """
+    Create a sample submission file format for reference
+    """
+    sample_data = {
+        'id_code': ['sample_image_1', 'sample_image_2', 'sample_image_3'],
+        'diagnosis': [0, 1, 2]
+    }
+    sample_df = pd.DataFrame(sample_data)
+    sample_df.to_csv('sample_submission_format.csv', index=False)
+    print("Sample submission format saved as 'sample_submission_format.csv'")
+
+def validate_submission_format(submission_file):
+    """
+    Validate submission file format
+    """
+    try:
+        df = pd.read_csv(submission_file)
+        
+        # Check required columns
+        required_cols = ['id_code', 'diagnosis']
+        if not all(col in df.columns for col in required_cols):
+            print(f"Error: Missing required columns. Expected: {required_cols}")
+            return False
+        
+        # Check diagnosis values
+        valid_diagnoses = set([0, 1, 2, 3, 4])
+        if not set(df['diagnosis'].unique()).issubset(valid_diagnoses):
+            print(f"Error: Invalid diagnosis values. Must be in {valid_diagnoses}")
+            return False
+        
+        # Check for missing values
+        if df.isnull().any().any():
+            print("Error: Submission contains missing values")
+            return False
+        
+        print(f" Submission format is valid!")
+        print(f"  - Rows: {len(df)}")
+        print(f"  - Columns: {list(df.columns)}")
+        print(f"  - Diagnosis range: {df['diagnosis'].min()} to {df['diagnosis'].max()}")
+        
+        return True
+        
+    except Exception as e:
+        print(f"Error validating submission: {e}")
+        return False
+
+if __name__ == "__main__":
+    # Run inference
+    submission_df, detailed_results = main()
+    
+    if submission_df is not None:
+        # Validate submission format
+        validate_submission_format('submission.csv')
+        
+        print("\n Inference completed successfully!")
+        print("\nFiles created:")
+        print("  - submission.csv (main submission file)")
+        print("  - detailed_predictions.json (detailed results)")
+        
+        print("\n Next steps:")
+        print("  1. Verify submission.csv format")
+        print("  2. Check prediction distribution")
+        print("  3. Submit to competition platform")
+    else:
+        print(" Inference failed. Please check the error messages above.")
