@@ -1,0 +1,343 @@
+import torch
+import torch.nn as nn
+import pandas as pd
+import numpy as np
+import cv2
+from PIL import Image
+import os
+from torch.utils.data import Dataset, DataLoader
+import torchvision.transforms as transforms
+from torchvision import models
+from tqdm import tqdm
+import warnings
+warnings.filterwarnings('ignore')
+
+# Set device
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+print(f"Using device: {device}")
+
+class DiabeticRetinopathyHVChannelDataset(Dataset):
+    """
+    Custom Dataset for Diabetic Retinopathy with HV (Hue-Value) channels only
+    """
+    def __init__(self, csv_file, img_dir, transform=None, is_test=False):
+        """
+        Args:
+            csv_file (string): Path to csv with image names and labels
+            img_dir (string): Directory with all images
+            transform (callable, optional): Transform to be applied on images
+            is_test (bool): Whether this is test dataset (no labels)
+        """
+        self.data = pd.read_csv(csv_file)
+        self.img_dir = img_dir
+        self.transform = transform
+        self.is_test = is_test
+        
+        # Print dataset statistics
+        if is_test:
+            print(f"Test dataset loaded: {len(self.data)} images")
+            print(f"Output channels: 2 (Hue + Value)")
+        
+    def __len__(self):
+        return len(self.data)
+    
+    def __getitem__(self, idx):
+        if torch.is_tensor(idx):
+            idx = idx.tolist()
+            
+        # Get image name
+        img_name = self.data.iloc[idx, 0]
+        
+        # Try different extensions
+        img_extensions = ['.jpeg', '.jpg', '.png']
+        img_path = None
+        
+        for ext in img_extensions:
+            potential_path = os.path.join(self.img_dir, f"{img_name}{ext}")
+            if os.path.exists(potential_path):
+                img_path = potential_path
+                break
+                
+        if img_path is None:
+            raise FileNotFoundError(f"Image {img_name} not found with any extension")
+        
+        # Load image
+        image = cv2.imread(img_path)
+        if image is None:
+            raise ValueError(f"Could not load image: {img_path}")
+        
+        # Convert BGR to RGB
+        image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        
+        # Convert RGB to HSV
+        image_hsv = cv2.cvtColor(image_rgb, cv2.COLOR_RGB2HSV)
+        
+        # Extract Hue and Value channels (H and V)
+        image_hv = image_hsv[:, :, [0, 2]]  # H, V channels
+        
+        # Convert to PIL Image for transforms
+        image_pil = Image.fromarray(image_hv.astype('uint8'))
+        
+        if self.transform:
+            image_pil = self.transform(image_pil)
+            
+        if not self.is_test:
+            label = int(self.data.iloc[idx, 1])
+            return image_pil, label
+        else:
+            return image_pil, img_name
+
+class DRHVChannelClassifier(nn.Module):
+    """
+    Diabetic Retinopathy Classifier for HV (Hue-Value) channels
+    """
+    def __init__(self, num_classes=5, pretrained=False, dropout_rate=0.5):
+        super(DRHVChannelClassifier, self).__init__()
+        
+        # Use ResNet50 as backbone
+        self.backbone = models.resnet50(pretrained=pretrained)
+        
+        # Modify first conv layer for 2 input channels (HV)
+        original_conv1 = self.backbone.conv1
+        
+        # Create new conv1 layer with 2 input channels
+        self.backbone.conv1 = nn.Conv2d(
+            2, 64, kernel_size=7, stride=2, padding=3, bias=False
+        )
+        
+        # Initialize new conv1 weights
+        if pretrained:
+            with torch.no_grad():
+                # Average pretrained RGB weights for HV channels initialization
+                rgb_weights = original_conv1.weight
+                avg_weights = rgb_weights.mean(dim=1, keepdim=True)
+                # Initialize with averaged weights repeated for both HV channels
+                self.backbone.conv1.weight = nn.Parameter(
+                    torch.cat([avg_weights, avg_weights], dim=1)
+                )
+        else:
+            # Initialize with He initialization
+            nn.init.kaiming_normal_(self.backbone.conv1.weight, mode='fan_out', nonlinearity='relu')
+        
+        # Store original fc layer input features
+        num_features = self.backbone.fc.in_features
+        
+        # Replace final layer with custom classifier
+        self.backbone.fc = nn.Sequential(
+            nn.Dropout(dropout_rate),
+            nn.Linear(num_features, 512),
+            nn.ReLU(inplace=True),
+            nn.Dropout(dropout_rate/2),
+            nn.Linear(512, num_classes)
+        )
+        
+        # Initialize weights for new layers
+        for m in self.backbone.fc.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight)
+                nn.init.constant_(m.bias, 0)
+        
+    def forward(self, x):
+        return self.backbone(x)
+
+def get_inference_transforms():
+    """
+    Define transforms for inference (validation transforms)
+    """
+    # Two-channel normalization for HV channels
+    mean = [0.5, 0.5]  # H, V channel means (normalized)
+    std = [0.3, 0.3]   # H, V channel stds (normalized)
+    
+    inference_transforms = transforms.Compose([
+        transforms.Resize((512, 512)),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=mean, std=std)
+    ])
+    
+    return inference_transforms
+
+def load_model(model_path, num_classes=5, dropout_rate=0.5):
+    """
+    Load the trained model from checkpoint
+    """
+    print(f"Loading model from: {model_path}")
+    
+    # Initialize model architecture
+    model = DRHVChannelClassifier(
+        num_classes=num_classes,
+        pretrained=False,  # Don't load pretrained weights since we're loading from checkpoint
+        dropout_rate=dropout_rate
+    )
+    
+    # Load model state dict
+    try:
+        checkpoint = torch.load(model_path, map_location=device)
+        model.load_state_dict(checkpoint)
+        print("✅ Model loaded successfully!")
+    except Exception as e:
+        print(f"❌ Error loading model: {e}")
+        return None
+    
+    model.to(device)
+    model.eval()
+    
+    return model
+
+def perform_inference(model, test_loader, output_file='submission.csv'):
+    """
+    Perform inference on test dataset and generate submission file
+    """
+    model.eval()
+    predictions = []
+    image_names = []
+    prediction_probabilities = []
+    
+    print("Performing inference on test dataset...")
+    print(f"Total batches: {len(test_loader)}")
+    
+    with torch.no_grad():
+        for batch_idx, (data, names) in enumerate(tqdm(test_loader, desc="Inference")):
+            data = data.to(device)
+            
+            # Get model outputs
+            outputs = model(data)
+            
+            # Convert to probabilities
+            probs = torch.softmax(outputs, dim=1)
+            
+            # Get predicted classes
+            preds = probs.argmax(dim=1)
+            
+            # Store results
+            predictions.extend(preds.cpu().numpy())
+            image_names.extend(names)
+            prediction_probabilities.extend(probs.cpu().numpy())
+    
+    # Create submission DataFrame
+    submission_df = pd.DataFrame({
+        'id_code': image_names,
+        'diagnosis': predictions
+    })
+    
+    # Sort by id_code to ensure consistent ordering
+    submission_df = submission_df.sort_values('id_code').reset_index(drop=True)
+    
+    # Save submission file
+    submission_df.to_csv(output_file, index=False)
+    print(f"✅ Submission file saved as: {output_file}")
+    
+    # Print some statistics
+    print(f"\nPrediction Statistics:")
+    print(f"Total predictions: {len(predictions)}")
+    prediction_counts = pd.Series(predictions).value_counts().sort_index()
+    for class_idx, count in prediction_counts.items():
+        percentage = (count / len(predictions)) * 100
+        print(f"Class {class_idx}: {count} images ({percentage:.1f}%)")
+    
+    # Also save detailed results with probabilities (optional)
+    detailed_results = pd.DataFrame({
+        'id_code': image_names,
+        'diagnosis': predictions,
+        'prob_class_0': [prob[0] for prob in prediction_probabilities],
+        'prob_class_1': [prob[1] for prob in prediction_probabilities],
+        'prob_class_2': [prob[2] for prob in prediction_probabilities],
+        'prob_class_3': [prob[3] for prob in prediction_probabilities],
+        'prob_class_4': [prob[4] for prob in prediction_probabilities],
+    })
+    detailed_results = detailed_results.sort_values('id_code').reset_index(drop=True)
+    detailed_results.to_csv('detailed_predictions.csv', index=False)
+    print(f"✅ Detailed predictions with probabilities saved as: detailed_predictions.csv")
+    
+    return submission_df, prediction_probabilities
+
+def main():
+    """
+    Main inference function
+    """
+    # Configuration - Update these paths according to your setup
+    config = {
+        'model_path': '/kaggle/input/diabetic-retinopathy-hv-channel-model/best_hv_model.pth',  # Path to your trained model
+        'test_csv': '/kaggle/input/aptos2019-blindness-detection/test.csv',  # Update path
+        'test_img_dir': '/kaggle/input/aptos2019-blindness-detection/test_images',  # Update path
+        'batch_size': 32,  # Can increase for faster inference if you have enough memory
+        'num_classes': 5,
+        'dropout_rate': 0.5,
+        'output_file': 'submission.csv'
+    }
+    
+    print("="*70)
+    print("DIABETIC RETINOPATHY HV MODEL INFERENCE")
+    print("="*70)
+    
+    # Check if model file exists
+    if not os.path.exists(config['model_path']):
+        print(f"❌ Model file not found: {config['model_path']}")
+        print("Please make sure the model file exists and update the path in config.")
+        return None
+    
+    # Check if test data exists
+    if not os.path.exists(config['test_csv']):
+        print(f"❌ Test CSV file not found: {config['test_csv']}")
+        print("Please update the test_csv path in config.")
+        return None
+        
+    if not os.path.exists(config['test_img_dir']):
+        print(f"❌ Test images directory not found: {config['test_img_dir']}")
+        print("Please update the test_img_dir path in config.")
+        return None
+    
+    # Load model
+    model = load_model(
+        config['model_path'], 
+        num_classes=config['num_classes'],
+        dropout_rate=config['dropout_rate']
+    )
+    
+    if model is None:
+        print("❌ Failed to load model. Exiting.")
+        return None
+    
+    # Get transforms
+    inference_transforms = get_inference_transforms()
+    
+    # Load test dataset
+    test_dataset = DiabeticRetinopathyHVChannelDataset(
+        csv_file=config['test_csv'],
+        img_dir=config['test_img_dir'],
+        transform=inference_transforms,
+        is_test=True
+    )
+    
+    # Create test data loader
+    test_loader = DataLoader(
+        test_dataset, 
+        batch_size=config['batch_size'], 
+        shuffle=False,  # Important: Don't shuffle for consistent results
+        num_workers=4, 
+        pin_memory=True
+    )
+    
+    print(f"Test dataset loaded: {len(test_dataset)} images")
+    print(f"Batch size: {config['batch_size']}")
+    print(f"Number of batches: {len(test_loader)}")
+    
+    # Perform inference
+    submission_df, probabilities = perform_inference(
+        model, 
+        test_loader, 
+        output_file=config['output_file']
+    )
+    
+    print(f"\n{'='*70}")
+    print("INFERENCE COMPLETED SUCCESSFULLY")
+    print(f"{'='*70}")
+    print(f"Submission file: {config['output_file']}")
+    print(f"Detailed predictions: detailed_predictions.csv")
+    print("Ready for submission! 🎉")
+    
+    return submission_df
+
+# Run inference
+if __name__ == "__main__":
+    # Update the paths in the config dictionary above before running
+    submission = main()
