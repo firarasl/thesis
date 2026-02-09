@@ -1,0 +1,316 @@
+import torch.nn as nn
+import torchvision.transforms as transforms
+from torchvision import models
+import pandas as pd
+import numpy as np
+import cv2
+from PIL import Image
+import os
+from torch.utils.data import Dataset, DataLoader
+from tqdm import tqdm
+import warnings
+warnings.filterwarnings('ignore')
+
+# Set device
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+print(f"Using device: {device}")
+
+class DiabeticRetinopathyHSVDataset(Dataset):
+    """
+    Custom Dataset for Diabetic Retinopathy with HSV color space conversion
+    """
+    def __init__(self, csv_file, img_dir, transform=None, is_test=False):
+        """
+        Args:
+            csv_file (string): Path to csv with image names and labels
+            img_dir (string): Directory with all images
+            transform (callable, optional): Transform to be applied on images
+            is_test (bool): Whether this is test dataset (no labels)
+        """
+        self.data = pd.read_csv(csv_file)
+        self.img_dir = img_dir
+        self.transform = transform
+        self.is_test = is_test
+        
+        print(f"HSV Test Dataset loaded: {len(self.data)} images")
+        
+    def __len__(self):
+        return len(self.data)
+    
+    def __getitem__(self, idx):
+        if torch.is_tensor(idx):
+            idx = idx.tolist()
+            
+        # Get image name
+        img_name = self.data.iloc[idx, 0]  # Assuming first column is image name
+        
+        # Try different extensions
+        img_extensions = ['.jpeg', '.jpg', '.png']
+        img_path = None
+        
+        for ext in img_extensions:
+            potential_path = os.path.join(self.img_dir, f"{img_name}{ext}")
+            if os.path.exists(potential_path):
+                img_path = potential_path
+                break
+                
+        if img_path is None:
+            raise FileNotFoundError(f"Image {img_name} not found with any extension")
+        
+        # Load image and convert to HSV
+        image = cv2.imread(img_path)
+        if image is None:
+            raise ValueError(f"Could not load image: {img_path}")
+        
+        # Convert BGR (OpenCV default) to RGB first
+        image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        
+        # Convert RGB to HSV
+        image_hsv = cv2.cvtColor(image_rgb, cv2.COLOR_RGB2HSV)
+        
+        # Convert to PIL Image for transforms
+        image_hsv = Image.fromarray(image_hsv)
+        
+        if self.transform:
+            image_hsv = self.transform(image_hsv)
+            
+        if not self.is_test:
+            label = int(self.data.iloc[idx, 1])  # Assuming second column is label
+            return image_hsv, label
+        else:
+            return image_hsv, img_name
+
+class DRHSVClassifier(nn.Module):
+    """
+    Diabetic Retinopathy Classifier using pretrained ResNet50 adapted for HSV images
+    """
+    def __init__(self, num_classes=5, pretrained=True, dropout_rate=0.5):
+        super(DRHSVClassifier, self).__init__()
+        
+        # Use ResNet50 as backbone
+        self.backbone = models.resnet50(pretrained=pretrained)
+        
+        # Store original fc layer input features
+        num_features = self.backbone.fc.in_features
+        
+        # Replace final layer with custom classifier
+        self.backbone.fc = nn.Sequential(
+            nn.Dropout(dropout_rate),
+            nn.Linear(num_features, 512),
+            nn.ReLU(inplace=True),
+            nn.Dropout(dropout_rate/2),
+            nn.Linear(512, num_classes)
+        )
+        
+    def forward(self, x):
+        return self.backbone(x)
+
+def get_inference_transforms():
+    """
+    Define preprocessing transforms for inference (no augmentation)
+    """
+    # HSV normalization values (same as training)
+    hsv_mean = [0.5, 0.5, 0.5]
+    hsv_std = [0.5, 0.3, 0.3]
+    
+    transforms_pipeline = transforms.Compose([
+        transforms.Resize((512, 512)),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=hsv_mean, std=hsv_std)
+    ])
+    
+    return transforms_pipeline
+
+def load_model(model_path, num_classes=5, dropout_rate=0.5):
+    """
+    Load the trained HSV model
+    """
+    print(f"Loading model from: {model_path}")
+    
+    # Initialize model architecture
+    model = DRHSVClassifier(
+        num_classes=num_classes,
+        pretrained=False,  # We're loading trained weights
+        dropout_rate=dropout_rate
+    )
+    
+    # Load trained weights
+    try:
+        checkpoint = torch.load(model_path, map_location=device)
+        model.load_state_dict(checkpoint)
+        print(" Model loaded successfully!")
+    except Exception as e:
+        print(f" Error loading model: {e}")
+        return None
+    
+    model.to(device)
+    model.eval()
+    
+    return model
+
+def generate_predictions(model, test_loader, use_tta=False):
+    """
+    Generate predictions for test set with optional Test Time Augmentation (TTA)
+    """
+    model.eval()
+    predictions = []
+    image_names = []
+    
+    print("Generating predictions...")
+    
+    with torch.no_grad():
+        for data, names in tqdm(test_loader, desc="Inference"):
+            data = data.to(device)
+            
+            if use_tta:
+                # Test Time Augmentation - apply multiple transformations and average
+                batch_size = data.size(0)
+                
+                # Original prediction
+                outputs = model(data)
+                
+                # Horizontal flip
+                outputs += model(torch.flip(data, dims=[3]))
+                
+                # Vertical flip
+                outputs += model(torch.flip(data, dims=[2]))
+                
+                # Both flips
+                outputs += model(torch.flip(data, dims=[2, 3]))
+                
+                # Average the predictions
+                outputs = outputs / 4
+            else:
+                outputs = model(data)
+            
+            # Convert to probabilities and get predictions
+            probs = torch.softmax(outputs, dim=1)
+            preds = probs.argmax(dim=1)
+            
+            predictions.extend(preds.cpu().numpy())
+            image_names.extend(names)
+    
+    return predictions, image_names
+
+def create_submission(predictions, image_names, output_file='submission.csv'):
+    """
+    Create submission file in the required format
+    """
+    # Create submission DataFrame
+    submission_df = pd.DataFrame({
+        'id_code': image_names,
+        'diagnosis': predictions
+    })
+    
+    # Save to CSV
+    submission_df.to_csv(output_file, index=False)
+    print(f" Submission saved to: {output_file}")
+    
+    # Print prediction distribution
+    print("\nPrediction Distribution:")
+    pred_counts = pd.Series(predictions).value_counts().sort_index()
+    class_names = ['No DR', 'Mild', 'Moderate', 'Severe', 'Proliferative']
+    
+    for class_idx, count in pred_counts.items():
+        percentage = (count / len(predictions)) * 100
+        print(f"  Class {class_idx} ({class_names[class_idx]}): {count} images ({percentage:.1f}%)")
+    
+    return submission_df
+
+def main():
+    """
+    Main inference pipeline
+    """
+    # Configuration
+    config = {
+        'model_path': '/kaggle/input/diabetic-retinopathy-hsv-model-experiment-2-3/best_hsv_model.pth',
+        'test_csv': '/kaggle/input/aptos2019-blindness-detection/test.csv',
+        'test_img_dir': '/kaggle/input/aptos2019-blindness-detection/test_images',
+        'batch_size': 32,  # Larger batch size for inference
+        'num_classes': 5,
+        'dropout_rate': 0.5,
+        'use_tta': True,  # Use Test Time Augmentation for better results
+        'output_file': 'submission.csv'
+    }
+    
+    print("="*70)
+    print("DIABETIC RETINOPATHY HSV MODEL - INFERENCE")
+    print("="*70)
+    print("Configuration:")
+    for key, value in config.items():
+        print(f"  {key}: {value}")
+    print("="*70)
+    
+    # Load model
+    model = load_model(
+        config['model_path'], 
+        num_classes=config['num_classes'],
+        dropout_rate=config['dropout_rate']
+    )
+    
+    if model is None:
+        print("Failed to load model. Exiting...")
+        return
+    
+    # Get inference transforms
+    inference_transforms = get_inference_transforms()
+    
+    # Load test dataset
+    print("\nLoading test dataset...")
+    test_dataset = DiabeticRetinopathyHSVDataset(
+        csv_file=config['test_csv'],
+        img_dir=config['test_img_dir'],
+        transform=inference_transforms,
+        is_test=True
+    )
+    
+    # Create test data loader
+    test_loader = DataLoader(
+        test_dataset,
+        batch_size=config['batch_size'],
+        shuffle=False,
+        num_workers=4,
+        pin_memory=True
+    )
+    
+    # Generate predictions
+    print(f"\nGenerating predictions (TTA: {'ON' if config['use_tta'] else 'OFF'})...")
+    predictions, image_names = generate_predictions(
+        model, 
+        test_loader, 
+        use_tta=config['use_tta']
+    )
+    
+    # Create submission file
+    submission_df = create_submission(
+        predictions, 
+        image_names, 
+        config['output_file']
+    )
+    
+    # Verify submission format
+    print(f"\nSubmission file verification:")
+    print(f"  Shape: {submission_df.shape}")
+    print(f"  Columns: {list(submission_df.columns)}")
+    print(f"  Total predictions: {len(predictions)}")
+    print(f"  Unique image names: {len(set(image_names))}")
+    
+    # Show first few predictions
+    print(f"\nFirst 10 predictions:")
+    print(submission_df.head(10))
+    
+    print("\n" + "="*70)
+    print("INFERENCE COMPLETED SUCCESSFULLY!")
+    print("="*70)
+    print(f"Submission file ready: {config['output_file']}")
+    print("You can now submit this file to the competition!")
+    
+    return submission_df
+
+if __name__ == "__main__":
+    # Set random seeds for reproducibility
+    torch.manual_seed(42)
+    np.random.seed(42)
+    
+    # Run inference
+    submission = main()
