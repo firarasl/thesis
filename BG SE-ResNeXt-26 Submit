@@ -1,0 +1,534 @@
+import torch
+import torch.nn as nn
+from torch.utils.data import Dataset, DataLoader
+import torchvision.transforms as transforms
+import pandas as pd
+import numpy as np
+import cv2
+from PIL import Image
+import os
+from tqdm import tqdm
+import warnings
+import random
+import json
+warnings.filterwarnings('ignore')
+
+# Set device
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+print(f"Using device: {device}")
+
+def crop_black_background(image, threshold=10):
+    """
+    Crop black background from retinal images
+    """
+    # Convert to grayscale for processing
+    if len(image.shape) == 3:
+        gray = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
+    else:
+        gray = image
+    
+    # Create mask for non-black pixels
+    mask = gray > threshold
+    
+    # Find bounding box of non-black region
+    coords = np.argwhere(mask)
+    if len(coords) == 0:
+        return image  # Return original if no non-black pixels found
+    
+    y0, x0 = coords.min(axis=0)
+    y1, x1 = coords.max(axis=0) + 1
+    
+    # Crop the image
+    cropped = image[y0:y1, x0:x1]
+    
+    return cropped
+
+def calculate_gb_normalization_stats(csv_file, img_dir, sample_size=100):
+    """
+    Calculate GB normalization stats if not available
+    """
+    print("Calculating GB normalization statistics from test data...")
+    data = pd.read_csv(csv_file)
+    
+    # Sample images for statistics calculation
+    sample_indices = np.random.choice(len(data), min(sample_size, len(data)), replace=False)
+    
+    all_pixels_g = []
+    all_pixels_b = []
+    
+    for idx in tqdm(sample_indices, desc="Computing GB stats"):
+        # Get image name
+        if 'id_code' in data.columns:
+            img_name = data.iloc[idx]['id_code']
+        else:
+            img_name = data.iloc[idx, 0]
+        
+        # Try different extensions
+        img_path = None
+        for ext in ['.jpeg', '.jpg', '.png']:
+            potential_path = os.path.join(img_dir, f"{img_name}{ext}")
+            if os.path.exists(potential_path):
+                img_path = potential_path
+                break
+        
+        if img_path is None:
+            continue
+            
+        try:
+            # Load image
+            image = cv2.imread(img_path)
+            if image is None:
+                continue
+                
+            # Convert BGR to RGB
+            image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+            
+            # Crop black background and resize
+            image_rgb = crop_black_background(image_rgb)
+            image_resized = cv2.resize(image_rgb, (512, 512))
+            
+            # Extract Green and Blue channels and normalize to [0,1]
+            green_channel = image_resized[:, :, 1].flatten() / 255.0
+            blue_channel = image_resized[:, :, 2].flatten() / 255.0
+            
+            # Sample pixels to avoid memory issues
+            sample_pixels = min(1000, len(green_channel))
+            indices = np.random.choice(len(green_channel), sample_pixels, replace=False)
+            
+            all_pixels_g.extend(green_channel[indices])
+            all_pixels_b.extend(blue_channel[indices])
+            
+        except Exception as e:
+            print(f"Error processing {img_name}: {e}")
+            continue
+    
+    if not all_pixels_g or not all_pixels_b:
+        print("Warning: No valid images found, using default normalization")
+        return [0.5, 0.5], [0.5, 0.5]
+    
+    # Calculate statistics
+    mean_g = np.mean(all_pixels_g)
+    mean_b = np.mean(all_pixels_b)
+    std_g = np.std(all_pixels_g)
+    std_b = np.std(all_pixels_b)
+    
+    # Ensure std is not too small
+    std_g = max(std_g, 0.1)
+    std_b = max(std_b, 0.1)
+    
+    print(f"GB Channel Statistics (from {len(sample_indices)} images):")
+    print(f"  Green Channel - Mean: {mean_g:.4f}, Std: {std_g:.4f}")
+    print(f"  Blue Channel - Mean: {mean_b:.4f}, Std: {std_b:.4f}")
+    
+    return [mean_g, mean_b], [std_g, std_b]
+
+class DiabeticRetinopathyGBDataset(Dataset):
+    """
+    Dataset for Diabetic Retinopathy with GB (Green-Blue) channels only - Test version
+    """
+    def __init__(self, csv_file, img_dir, image_size=512, gb_mean=None, gb_std=None):
+        """
+        Args:
+            csv_file (string): Path to csv with image names
+            img_dir (string): Directory with all images
+            image_size (int): Target image size (512x512)
+            gb_mean (list): Mean values for GB channels
+            gb_std (list): Std values for GB channels
+        """
+        self.data = pd.read_csv(csv_file)
+        self.img_dir = img_dir
+        self.image_size = image_size
+        self.gb_mean = gb_mean or [0.5, 0.5]
+        self.gb_std = gb_std or [0.5, 0.5]
+        
+        print(f"GB Test dataset loaded: {len(self.data)} images")
+        print(f"GB Normalization - Mean: {self.gb_mean}, Std: {self.gb_std}")
+        
+    def __len__(self):
+        return len(self.data)
+    
+    def preprocess_image(self, image_path):
+        """
+        Enhanced preprocessing with black background cropping for GB channels
+        """
+        # Load image
+        image = cv2.imread(image_path)
+        if image is None:
+            raise ValueError(f"Could not load image: {image_path}")
+        
+        # Convert BGR to RGB
+        image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        
+        # Crop black background
+        image_rgb = crop_black_background(image_rgb, threshold=10)
+        
+        # Resize to target size
+        image_rgb = cv2.resize(image_rgb, (self.image_size, self.image_size))
+        
+        # Extract Green and Blue channels only
+        image_gb = np.zeros((image_rgb.shape[0], image_rgb.shape[1], 2), dtype=np.uint8)
+        image_gb[:, :, 0] = image_rgb[:, :, 1]  # Green channel
+        image_gb[:, :, 1] = image_rgb[:, :, 2]  # Blue channel
+        
+        return image_gb
+    
+    def __getitem__(self, idx):
+        if torch.is_tensor(idx):
+            idx = idx.tolist()
+            
+        # Get image name (for test dataset, the column name might be 'id_code')
+        if 'id_code' in self.data.columns:
+            img_name = self.data.iloc[idx]['id_code']
+        else:
+            img_name = self.data.iloc[idx, 0]
+        
+        # Try different extensions
+        img_extensions = ['.png', '.jpg', '.jpeg']
+        img_path = None
+        
+        for ext in img_extensions:
+            potential_path = os.path.join(self.img_dir, f"{img_name}{ext}")
+            if os.path.exists(potential_path):
+                img_path = potential_path
+                break
+                
+        if img_path is None:
+            raise FileNotFoundError(f"Image {img_name} not found with any extension")
+    
+        # Load and preprocess image
+        gb_image = self.preprocess_image(img_path)
+        
+        # Convert to tensor
+        gb_tensor = torch.from_numpy(gb_image.transpose(2, 0, 1)).float() / 255.0
+        
+        # Apply GB-specific normalization
+        for i in range(2):
+            gb_tensor[i] = (gb_tensor[i] - self.gb_mean[i]) / self.gb_std[i]
+        
+        return gb_tensor, img_name
+
+class DRGBChannelSEResNeXt(nn.Module):
+    """
+    Diabetic Retinopathy Classifier for GB (Green-Blue) channels using SE-ResNeXt
+    """
+    def __init__(self, num_classes=5, dropout_rate=0.5, model_name='seresnext26d_32x4d'):
+        super(DRGBChannelSEResNeXt, self).__init__()
+        
+        # Import timm locally
+        import timm
+        
+        # Load SE-ResNeXt with 2 input channels
+        self.backbone = timm.create_model(
+            model_name, 
+            pretrained=False,  # We'll load weights from file
+            num_classes=0,  # Remove classification head
+            in_chans=2      # 2 input channels for GB
+        )
+        feature_dim = self.backbone.num_features
+        
+        # Enhanced classifier with regularization
+        self.classifier = nn.Sequential(
+            nn.Dropout(dropout_rate),
+            nn.Linear(feature_dim, 1024),
+            nn.ReLU(inplace=True),
+            nn.BatchNorm1d(1024),
+            nn.Dropout(dropout_rate/2),
+            nn.Linear(1024, 512),
+            nn.ReLU(inplace=True),
+            nn.BatchNorm1d(512),
+            nn.Dropout(dropout_rate/2),
+            nn.Linear(512, num_classes)
+        )
+    
+    def forward(self, x):
+        # Extract features
+        features = self.backbone(x)
+        
+        # Final classification
+        output = self.classifier(features)
+        
+        return output
+
+def safe_load_model(model_path, num_classes=5, dropout_rate=0.5, model_name='seresnext26d_32x4d'):
+    """
+    Safely load the trained GB channel SE-ResNeXt model with proper error handling
+    """
+    print(f"Loading GB model from: {model_path}")
+    
+    # Initialize model
+    model = DRGBChannelSEResNeXt(
+        num_classes=num_classes,
+        dropout_rate=dropout_rate,
+        model_name=model_name
+    )
+    
+    # Try different loading methods
+    checkpoint = None
+    
+    try:
+        # Method 1: Try with weights_only=True (safe)
+        print("Attempting to load with weights_only=True...")
+        checkpoint = torch.load(model_path, map_location=device, weights_only=True)
+    except Exception as e1:
+        print(f"weights_only=True failed: {e1}")
+        try:
+            # Method 2: Try with weights_only=False (less safe but necessary for some checkpoints)
+            print("Attempting to load with weights_only=False...")
+            checkpoint = torch.load(model_path, map_location=device, weights_only=False)
+        except Exception as e2:
+            print(f"weights_only=False failed: {e2}")
+            try:
+                # Method 3: Try loading with pickle (legacy method)
+                print("Attempting to load with pickle...")
+                import pickle
+                with open(model_path, 'rb') as f:
+                    checkpoint = pickle.load(f)
+            except Exception as e3:
+                print(f"Pickle loading failed: {e3}")
+                raise RuntimeError("All model loading methods failed")
+    
+    if checkpoint is None:
+        raise RuntimeError("Could not load model checkpoint")
+    
+    # Handle different checkpoint formats
+    if 'model_state_dict' in checkpoint:
+        model.load_state_dict(checkpoint['model_state_dict'])
+        print("Loaded model from checkpoint format (model_state_dict)")
+    elif 'state_dict' in checkpoint:
+        model.load_state_dict(checkpoint['state_dict'])
+        print("Loaded model from checkpoint format (state_dict)")
+    else:
+        # Assume it's directly the state dict
+        model.load_state_dict(checkpoint)
+        print("Loaded model from state dict format")
+    
+    model.to(device)
+    model.eval()
+    
+    print("GB Channel SE-ResNeXt model loaded successfully!")
+    print(f"Model architecture: {model_name}")
+    print(f"Input channels: 2 (GB)")
+    return model
+
+def load_normalization_stats(stats_path=None, csv_file=None, img_dir=None):
+    """
+    Load GB normalization statistics from file or calculate them
+    """
+    # Try to load from file first
+    if stats_path and os.path.exists(stats_path):
+        print(f"Loading normalization stats from: {stats_path}")
+        try:
+            with open(stats_path, 'r') as f:
+                stats = json.load(f)
+            
+            # Handle different possible key formats
+            if 'gb_mean' in stats:
+                gb_mean = stats['gb_mean']
+                gb_std = stats['gb_std']
+            elif 'mean' in stats:
+                gb_mean = stats['mean']
+                gb_std = stats['std']
+            else:
+                # Try to find any list-like values that could be mean/std
+                for key, value in stats.items():
+                    if isinstance(value, list) and len(value) == 2:
+                        if 'mean' in key.lower():
+                            gb_mean = value
+                        elif 'std' in key.lower():
+                            gb_std = value
+                
+                if 'gb_mean' not in locals():
+                    raise KeyError("Could not find mean/std in stats file")
+            
+            image_size = stats.get('image_size', 512)
+            
+            print(f"GB Normalization - Mean: {gb_mean}, Std: {gb_std}")
+            print(f"Image size: {image_size}")
+            
+            return gb_mean, gb_std, image_size
+            
+        except Exception as e:
+            print(f"Error loading normalization stats: {e}")
+    
+    # If file loading fails or no file provided, calculate from data
+    if csv_file and img_dir:
+        print("Calculating normalization stats from test data...")
+        gb_mean, gb_std = calculate_gb_normalization_stats(csv_file, img_dir)
+        return gb_mean, gb_std, 512
+    else:
+        print("Using default normalization values")
+        return [0.5, 0.5], [0.5, 0.5], 512
+
+def perform_inference(model, test_loader, use_tta=True):
+    """
+    Perform inference on test dataset with optional Test Time Augmentation
+    """
+    model.eval()
+    predictions = []
+    image_names = []
+    
+    print("Performing GB channel inference...")
+    
+    with torch.no_grad():
+        for data, img_names in tqdm(test_loader, desc="GB Inference"):
+            data = data.to(device)
+            
+            if use_tta:
+                # Test Time Augmentation for GB channels
+                tta_predictions = []
+                
+                # Original
+                output = model(data)
+                tta_predictions.append(torch.softmax(output, dim=1))
+                
+                # Horizontal flip
+                data_flipped = torch.flip(data, dims=[3])
+                output_flipped = model(data_flipped)
+                tta_predictions.append(torch.softmax(output_flipped, dim=1))
+                
+                # Vertical flip
+                data_vflipped = torch.flip(data, dims=[2])
+                output_vflipped = model(data_vflipped)
+                tta_predictions.append(torch.softmax(output_vflipped, dim=1))
+                
+                # Average predictions
+                avg_prediction = torch.mean(torch.stack(tta_predictions), dim=0)
+                pred_classes = avg_prediction.argmax(dim=1)
+                
+            else:
+                # No TTA - single prediction
+                output = model(data)
+                pred_classes = output.argmax(dim=1)
+            
+            predictions.extend(pred_classes.cpu().numpy())
+            image_names.extend(img_names)
+    
+    return predictions, image_names
+
+def create_submission(predictions, image_names, output_file='submission_gb_seresnext.csv'):
+    """
+    Create submission CSV file
+    """
+    print(f"Creating submission file: {output_file}")
+    
+    # Create submission dataframe
+    submission_df = pd.DataFrame({
+        'id_code': image_names,
+        'diagnosis': predictions
+    })
+    
+    # Save submission
+    submission_df.to_csv(output_file, index=False)
+    
+    print(f"Submission file created with {len(submission_df)} predictions")
+    print(f"Prediction distribution:")
+    print(submission_df['diagnosis'].value_counts().sort_index())
+    
+    return submission_df
+
+def main():
+    """
+    Main inference pipeline for GB channel SE-ResNeXt
+    """
+    # Configuration - UPDATE THESE PATHS FOR YOUR KAGGLE NOTEBOOK
+    config = {
+        'model_path': '/kaggle/input/bg-se-resnext26-training-512x512/best_gb_seresnext.pth',  # Update this path
+        'normalization_stats': '/kaggle/input/bg-se-resnext26-training-512x512/gb_seresnext_training_results.json',  # Optional
+        'test_csv': '/kaggle/input/aptos2019-blindness-detection/test.csv',
+        'test_img_dir': '/kaggle/input/aptos2019-blindness-detection/test_images',
+        'batch_size': 16,
+        'num_classes': 5,
+        'dropout_rate': 0.5,
+        'model_name': 'seresnext26d_32x4d',
+        'use_tta': True,  # Use Test Time Augmentation
+        'output_file': 'submission.csv'
+    }
+    
+    print("="*70)
+    print("GB CHANNEL SE-RESNEXT DIABETIC RETINOPATHY INFERENCE")
+    print("="*70)
+    print(f"Model path: {config['model_path']}")
+    print(f"Model architecture: SE-ResNeXt-26x4d (GB channels only)")
+    print(f"Test CSV: {config['test_csv']}")
+    print(f"Test images: {config['test_img_dir']}")
+    print(f"Batch size: {config['batch_size']}")
+    print(f"TTA enabled: {config['use_tta']}")
+    print("="*70)
+    
+    # Load normalization statistics
+    gb_mean, gb_std, image_size = load_normalization_stats(
+        stats_path=config.get('normalization_stats'),
+        csv_file=config['test_csv'],
+        img_dir=config['test_img_dir']
+    )
+    
+    # Load model
+    model = safe_load_model(
+        config['model_path'],
+        num_classes=config['num_classes'],
+        dropout_rate=config['dropout_rate'],
+        model_name=config['model_name']
+    )
+    
+    # Create test dataset
+    print(f"\nLoading GB test dataset (size: {image_size}x{image_size})...")
+    test_dataset = DiabeticRetinopathyGBDataset(
+        csv_file=config['test_csv'],
+        img_dir=config['test_img_dir'],
+        image_size=image_size,
+        gb_mean=gb_mean,
+        gb_std=gb_std
+    )
+    
+    # Create test data loader
+    test_loader = DataLoader(
+        test_dataset,
+        batch_size=config['batch_size'],
+        shuffle=False,
+        num_workers=4,
+        pin_memory=True
+    )
+    
+    # Perform inference
+    print(f"\nStarting inference with GB Channel SE-ResNeXt ({image_size}x{image_size})...")
+    predictions, image_names = perform_inference(
+        model, 
+        test_loader, 
+        use_tta=config['use_tta']
+    )
+    
+    # Create submission file
+    submission_df = create_submission(
+        predictions, 
+        image_names, 
+        config['output_file']
+    )
+    
+    print(f"\nGB Channel Inference completed successfully!")
+    print(f"Submission file saved: {config['output_file']}")
+    
+    # Display first few predictions
+    print("\nFirst 10 predictions:")
+    print(submission_df.head(10))
+    
+    # Save normalization stats used for future reference
+    norm_stats_used = {
+        'gb_mean': gb_mean,
+        'gb_std': gb_std,
+        'image_size': image_size,
+        'model_used': config['model_path']
+    }
+    with open('normalization_stats_used.json', 'w') as f:
+        json.dump(norm_stats_used, f, indent=2)
+    print("Normalization stats used saved to 'normalization_stats_used.json'")
+    
+    return submission_df
+
+if __name__ == "__main__":
+    # Set random seeds for reproducibility
+    torch.manual_seed(42)
+    np.random.seed(42)
+    random.seed(42)
+    
+    # Run inference
+    submission_df = main()
