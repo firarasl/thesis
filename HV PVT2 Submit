@@ -1,0 +1,354 @@
+import torch
+import torch.nn as nn
+from torch.utils.data import Dataset, DataLoader
+import torchvision.transforms as transforms
+import pandas as pd
+import numpy as np
+import cv2
+from PIL import Image
+import os
+from tqdm import tqdm
+import warnings
+warnings.filterwarnings('ignore')
+
+# Set device
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+print(f"Using device: {device}")
+
+# Import timm for PVTv2
+import timm
+
+class DiabeticRetinopathyHVDataset(Dataset):
+    """
+    Custom Dataset for Diabetic Retinopathy with HV (Hue-Value) channels (Test Dataset)
+    """
+    def __init__(self, csv_file, img_dir, transform=None):
+        """
+        Args:
+            csv_file (string): Path to csv with image names
+            img_dir (string): Directory with all images
+            transform (callable, optional): Transform to be applied on images
+        """
+        self.data = pd.read_csv(csv_file)
+        self.img_dir = img_dir
+        self.transform = transform
+        
+        print(f"Test dataset loaded: {len(self.data)} images")
+        print(f"Input channels: 2 (Hue + Value)")
+        
+    def __len__(self):
+        return len(self.data)
+    
+    def __getitem__(self, idx):
+        if torch.is_tensor(idx):
+            idx = idx.tolist()
+            
+        # Get image name (assuming the CSV has 'id_code' column)
+        img_name = self.data.iloc[idx, 0]  # First column should be image ID
+        
+        # Try different extensions
+        img_extensions = ['.png', '.jpg', '.jpeg']
+        img_path = None
+        
+        for ext in img_extensions:
+            potential_path = os.path.join(self.img_dir, f"{img_name}{ext}")
+            if os.path.exists(potential_path):
+                img_path = potential_path
+                break
+                
+        if img_path is None:
+            raise FileNotFoundError(f"Image {img_name} not found with any extension")
+        
+        # Load image
+        image = cv2.imread(img_path)
+        if image is None:
+            raise ValueError(f"Could not load image: {img_path}")
+        
+        # Convert BGR to RGB
+        image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        
+        # Convert RGB to HSV
+        image_hsv = cv2.cvtColor(image_rgb, cv2.COLOR_RGB2HSV)
+        
+        # Extract Hue and Value channels (H and V)
+        image_hv = image_hsv[:, :, [0, 2]]  # H, V channels
+        
+        # Convert to PIL Image for transforms
+        image_pil = Image.fromarray(image_hv.astype('uint8'))
+        
+        if self.transform:
+            image_pil = self.transform(image_pil)
+            
+        return image_pil, img_name
+
+class DRHVChannelPVT2Classifier(nn.Module):
+    """
+    Diabetic Retinopathy Classifier for HV (Hue-Value) channels using PVT2 transformer
+    """
+    def __init__(self, num_classes=5, pretrained=False, dropout_rate=0.5, model_name='pvt_v2_b2'):
+        super(DRHVChannelPVT2Classifier, self).__init__()
+        
+        # Use PVT2 from timm as backbone
+        self.backbone = timm.create_model(
+            model_name, 
+            pretrained=pretrained, 
+            num_classes=0,  # We'll add our own classifier
+            in_chans=2  # HV has 2 channels (Hue, Value)
+        )
+        
+        # Get the number of features from the backbone
+        self.num_features = self.backbone.num_features
+        
+        # Replace the classifier head
+        self.classifier = nn.Sequential(
+            nn.Dropout(dropout_rate),
+            nn.Linear(self.num_features, 512),
+            nn.ReLU(inplace=True),
+            nn.Dropout(dropout_rate/2),
+            nn.Linear(512, num_classes)
+        )
+        
+    def forward(self, x):
+        # Forward through PVT2 backbone
+        features = self.backbone(x)  # Shape: (batch_size, num_features)
+        
+        # Classify
+        output = self.classifier(features)
+        return output
+
+def get_hv_test_transforms():
+    """
+    Define preprocessing transforms for test images (no augmentation)
+    Uses HV-specific normalization
+    """
+    # Two-channel normalization for HV channels
+    # Hue: 0-179 in OpenCV HSV, Value: 0-255
+    # Normalized values (same as training)
+    mean = [0.5, 0.5]  # H, V channel means (normalized)
+    std = [0.3, 0.3]   # H, V channel stds (normalized)
+    
+    test_transforms = transforms.Compose([
+        transforms.Resize((512, 512)),  # PVT2 uses 512x512
+        transforms.ToTensor(),
+        transforms.Normalize(mean=mean, std=std)
+    ])
+    
+    return test_transforms
+
+def load_trained_model(model_path, num_classes=5, dropout_rate=0.5):
+    """
+    Load the pre-trained HV Channel PVT2 model
+    """
+    print(f"Loading model from: {model_path}")
+    
+    # Initialize model architecture WITHOUT downloading pretrained weights
+    model = DRHVChannelPVT2Classifier(
+        num_classes=num_classes,
+        dropout_rate=dropout_rate,
+        pretrained=False,
+        model_name='pvt_v2_b2'
+    )
+    
+    # Load trained weights
+    checkpoint = torch.load(model_path, map_location=device)
+    
+    # Handle state dict format (check if it's the full model or just state_dict)
+    if isinstance(checkpoint, dict) and 'state_dict' in checkpoint:
+        model.load_state_dict(checkpoint['state_dict'])
+    else:
+        model.load_state_dict(checkpoint)
+        
+    model.to(device)
+    model.eval()
+    
+    print("HV Channel PVT2 Model loaded successfully!")
+    return model
+
+def generate_predictions(model, test_loader, use_tta=False):
+    """
+    Generate predictions for test set
+    
+    Args:
+        model: Trained model
+        test_loader: DataLoader for test set
+        use_tta: Whether to use Test Time Augmentation (TTA)
+    """
+    model.eval()
+    predictions = []
+    image_names = []
+    all_probabilities = []
+    
+    print("Generating predictions...")
+    
+    with torch.no_grad():
+        for data, names in tqdm(test_loader, desc="Processing test images"):
+            data = data.to(device)
+            
+            if use_tta:
+                # Test Time Augmentation for HV channels
+                outputs = model(data)
+                
+                # Horizontal flip
+                outputs += model(torch.flip(data, dims=[3]))
+                
+                # Vertical flip
+                outputs += model(torch.flip(data, dims=[2]))
+                
+                # Average the predictions
+                outputs = outputs / 3.0
+            else:
+                outputs = model(data)
+            
+            # Convert logits to probabilities
+            probs = torch.softmax(outputs, dim=1)
+            
+            # Get predicted classes
+            preds = probs.argmax(dim=1)
+            
+            predictions.extend(preds.cpu().numpy())
+            image_names.extend(names)
+            all_probabilities.extend(probs.cpu().numpy())
+    
+    return predictions, image_names, np.array(all_probabilities)
+
+def create_submission_file(predictions, image_names, output_file='hv_pvt2_submission.csv'):
+    """
+    Create submission file in Kaggle format
+    """
+    submission_df = pd.DataFrame({
+        'id_code': image_names,
+        'diagnosis': predictions
+    })
+    
+    # Sort by id_code to ensure consistent ordering
+    submission_df = submission_df.sort_values('id_code')
+    
+    # Save to CSV
+    submission_df.to_csv(output_file, index=False)
+    
+    print(f"Submission file saved: {output_file}")
+    print(f"Total predictions: {len(submission_df)}")
+    
+    # Print prediction distribution
+    print("\nPrediction distribution:")
+    label_names = ['No DR', 'Mild', 'Moderate', 'Severe', 'Proliferative']
+    for i, label in enumerate(label_names):
+        count = (submission_df['diagnosis'] == i).sum()
+        percentage = count / len(submission_df) * 100
+        print(f"  Class {i} ({label}): {count} images ({percentage:.1f}%)")
+    
+    return submission_df
+
+def main():
+    """
+    Main inference pipeline for HV Channel PVT2 model
+    """
+    # Configuration
+    config = {
+        'model_path': '/kaggle/input/hv-pvt2-training/best_hv_pvt2_model.pth',  # Update with your model path
+        'test_csv': '/kaggle/input/aptos2019-blindness-detection/test.csv',
+        'test_img_dir': '/kaggle/input/aptos2019-blindness-detection/test_images',
+        'batch_size': 16,  # Smaller batch size for transformer inference
+        'num_classes': 5,
+        'dropout_rate': 0.5,
+        'use_tta': True,  # Use Test Time Augmentation for better results
+        'output_file': 'submission.csv'
+    }
+    
+    print("="*70)
+    print("DIABETIC RETINOPATHY HV (HUE-VALUE) CHANNEL PVT2 MODEL - INFERENCE")
+    print("="*70)
+    print("Configuration:")
+    for key, value in config.items():
+        print(f"  {key}: {value}")
+    print("="*70)
+    
+    # Check if test files exist
+    if not os.path.exists(config['test_csv']):
+        print(f"Error: Test CSV file not found at {config['test_csv']}")
+        return
+    
+    if not os.path.exists(config['test_img_dir']):
+        print(f"Error: Test images directory not found at {config['test_img_dir']}")
+        return
+    
+    if not os.path.exists(config['model_path']):
+        print(f"Error: Model file not found at {config['model_path']}")
+        print("Please make sure the model file exists or update the model_path in the config.")
+        return
+    
+    # Load trained model
+    model = load_trained_model(
+        config['model_path'], 
+        config['num_classes'], 
+        config['dropout_rate']
+    )
+    
+    # Get HV-specific test transforms
+    test_transforms = get_hv_test_transforms()
+    
+    # Load test dataset
+    print("\nLoading test data...")
+    test_dataset = DiabeticRetinopathyHVDataset(
+        csv_file=config['test_csv'],
+        img_dir=config['test_img_dir'],
+        transform=test_transforms
+    )
+    
+    # Create test data loader
+    test_loader = DataLoader(
+        test_dataset, 
+        batch_size=config['batch_size'], 
+        shuffle=False, 
+        num_workers=4,
+        pin_memory=True
+    )
+    
+    # Generate predictions
+    print(f"\nGenerating predictions with TTA: {config['use_tta']}")
+    predictions, image_names, probabilities = generate_predictions(
+        model, 
+        test_loader, 
+        use_tta=config['use_tta']
+    )
+    
+    # Create submission file
+    print("\nCreating submission file...")
+    submission_df = create_submission_file(
+        predictions, 
+        image_names, 
+        config['output_file']
+    )
+    
+    # Calculate confidence statistics
+    max_probs = np.max(probabilities, axis=1)
+    print(f"\nConfidence statistics:")
+    print(f"  Mean confidence: {np.mean(max_probs):.4f}")
+    print(f"  Std confidence: {np.std(max_probs):.4f}")
+    print(f"  Min confidence: {np.min(max_probs):.4f}")
+    print(f"  Max confidence: {np.max(max_probs):.4f}")
+    
+    # Show samples with lowest confidence
+    low_confidence_indices = np.argsort(max_probs)[:5]
+    print(f"\n5 predictions with lowest confidence:")
+    for i, idx in enumerate(low_confidence_indices):
+        print(f"  {i+1}. {image_names[idx]}: Class {predictions[idx]} (confidence: {max_probs[idx]:.4f})")
+    
+    print("\n" + "="*70)
+    print("HV CHANNEL PVT2 INFERENCE COMPLETED SUCCESSFULLY!")
+    print("="*70)
+    print(f"Submission file: {config['output_file']}")
+    print(f"Total test images processed: {len(predictions)}")
+    print("="*70)
+    
+    return submission_df
+
+if __name__ == "__main__":
+    # Set random seeds for reproducibility
+    torch.manual_seed(42)
+    np.random.seed(42)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+    
+    # Run inference
+    submission_df = main()
