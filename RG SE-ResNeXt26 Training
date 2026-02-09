@@ -1,0 +1,640 @@
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader
+import torchvision.transforms as transforms
+import pandas as pd
+import numpy as np
+import cv2
+from PIL import Image
+import os
+from sklearn.metrics import cohen_kappa_score, confusion_matrix, classification_report
+from sklearn.model_selection import train_test_split
+import matplotlib.pyplot as plt
+import seaborn as sns
+from tqdm import tqdm
+import warnings
+import json
+from datetime import datetime
+import random
+warnings.filterwarnings('ignore')
+
+# Set device
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+print(f"Using device: {device}")
+
+# Install timm for SE-ResNeXt
+try:
+    import timm
+    print("timm is already installed")
+except ImportError:
+    print("Installing timm...")
+    import subprocess
+    subprocess.run(['pip', 'install', 'timm'])
+    import timm
+
+# Set seeds for reproducibility
+def set_seed(seed=42):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+set_seed(42)
+
+def crop_black_background(image, threshold=10):
+    """
+    Crop black background from retinal images - SAME AS RGB VERSION
+    """
+    if len(image.shape) == 3:
+        gray = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
+    else:
+        gray = image
+    
+    mask = gray > threshold
+    coords = np.argwhere(mask)
+    if len(coords) == 0:
+        return image
+    
+    y0, x0 = coords.min(axis=0)
+    y1, x1 = coords.max(axis=0) + 1
+    cropped = image[y0:y1, x0:x1]
+    return cropped
+
+def calculate_rg_normalization_stats(csv_file, img_dir, sample_size=500, image_size=384):
+    """
+    Calculate RG normalization statistics at SAME RESOLUTION as training
+    """
+    print("Calculating RG channel normalization statistics...")
+    data = pd.read_csv(csv_file)
+    
+    sample_indices = np.random.choice(len(data), min(sample_size, len(data)), replace=False)
+    
+    all_pixels_r = []
+    all_pixels_g = []
+    
+    for idx in tqdm(sample_indices, desc="Computing RG stats"):
+        img_name = data.iloc[idx, 0]
+        img_path = None
+        for ext in ['.jpeg', '.jpg', '.png']:
+            potential_path = os.path.join(img_dir, f"{img_name}{ext}")
+            if os.path.exists(potential_path):
+                img_path = potential_path
+                break
+        
+        if img_path is None:
+            continue
+            
+        try:
+            image = cv2.imread(img_path)
+            if image is None:
+                continue
+                
+            image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+            image_rgb = crop_black_background(image_rgb, threshold=10)  # SAME CROPPING
+            image_resized = cv2.resize(image_rgb, (image_size, image_size))  # TRAINING SIZE
+            
+            red_channel = image_resized[:, :, 0].flatten() / 255.0
+            green_channel = image_resized[:, :, 1].flatten() / 255.0
+            
+            sample_pixels = min(1000, len(red_channel))
+            indices = np.random.choice(len(red_channel), sample_pixels, replace=False)
+            
+            all_pixels_r.extend(red_channel[indices])
+            all_pixels_g.extend(green_channel[indices])
+            
+        except Exception as e:
+            continue
+    
+    if not all_pixels_r or not all_pixels_g:
+        print("Warning: No valid images found, using default normalization")
+        return [0.5, 0.5], [0.5, 0.5]
+    
+    mean_r = np.mean(all_pixels_r)
+    mean_g = np.mean(all_pixels_g)
+    std_r = np.std(all_pixels_r)
+    std_g = np.std(all_pixels_g)
+    
+    std_r = max(std_r, 0.1)
+    std_g = max(std_g, 0.1)
+    
+    print(f"RG Channel Statistics (from {len(sample_indices)} images at {image_size}x{image_size}):")
+    print(f"  Red Channel - Mean: {mean_r:.4f}, Std: {std_r:.4f}")
+    print(f"  Green Channel - Mean: {mean_g:.4f}, Std: {std_g:.4f}")
+    
+    return [mean_r, mean_g], [std_r, std_g]
+
+class DiabeticRetinopathyRGDataset(Dataset):
+    """
+    RG Dataset with SAME preprocessing as RGB version
+    """
+    def __init__(self, csv_file, img_dir, transform=None, is_test=False, image_size=384):
+        self.data = pd.read_csv(csv_file)
+        self.img_dir = img_dir
+        self.transform = transform
+        self.is_test = is_test
+        self.image_size = image_size
+        
+        if not is_test:
+            print(f"RG Dataset loaded: {len(self.data)} images")
+            label_counts = self.data.iloc[:, 1].value_counts().sort_index()
+            print("Class distribution:")
+            for label, count in label_counts.items():
+                print(f"  Class {label}: {count} images ({count/len(self.data)*100:.1f}%)")
+    
+    def __len__(self):
+        return len(self.data)
+    
+    def preprocess_image(self, image_path):
+        """SAME preprocessing as RGB version"""
+        image = cv2.imread(image_path)
+        if image is None:
+            raise ValueError(f"Could not load image: {image_path}")
+        
+        image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        image = crop_black_background(image, threshold=10)  # SAME CROPPING
+        image = cv2.resize(image, (self.image_size, self.image_size))  # SAME SIZE
+        
+        # Extract RG channels
+        image_rg = np.zeros((image.shape[0], image.shape[1], 2), dtype=np.uint8)
+        image_rg[:, :, 0] = image[:, :, 0]  # Red channel
+        image_rg[:, :, 1] = image[:, :, 1]  # Green channel
+        
+        return image_rg
+    
+    def __getitem__(self, idx):
+        if torch.is_tensor(idx):
+            idx = idx.tolist()
+            
+        img_name = str(self.data.iloc[idx, 0])
+        img_path = None
+        for ext in ['.jpeg', '.jpg', '.png']:
+            potential_path = os.path.join(self.img_dir, f"{img_name}{ext}")
+            if os.path.exists(potential_path):
+                img_path = potential_path
+                break
+                
+        if img_path is None:
+            raise FileNotFoundError(f"Image {img_name} not found")
+        
+        try:
+            # Use enhanced preprocessing with cropping
+            image_rg = self.preprocess_image(img_path)
+            
+            # Convert to PIL for transforms
+            image_pil = Image.fromarray(image_rg)
+            
+            if self.transform:
+                image_tensor = self.transform(image_pil)
+            else:
+                # Default conversion
+                image_tensor = torch.from_numpy(image_rg.transpose(2, 0, 1)).float() / 255.0
+                
+        except Exception as e:
+            print(f"Error loading image {img_name}: {e}")
+            image_tensor = torch.zeros((2, self.image_size, self.image_size), dtype=torch.float32)
+            
+        if not self.is_test:
+            label = int(self.data.iloc[idx, 1])
+            return image_tensor, label
+        else:
+            return image_tensor, img_name
+
+def apply_perspective_transform(image, max_shift=0.1):
+    """SAME AS RGB VERSION"""
+    h, w = image.shape[:2]
+    shift_x = random.uniform(-max_shift, max_shift) * w
+    shift_y = random.uniform(-max_shift, max_shift) * h
+    
+    src_points = np.float32([[0, 0], [w, 0], [w, h], [0, h]])
+    dst_points = np.float32([
+        [shift_x, shift_y],
+        [w - shift_x, shift_y],
+        [w - shift_x, h - shift_y],
+        [shift_x, h - shift_y]
+    ])
+    
+    matrix = cv2.getPerspectiveTransform(src_points, dst_points)
+    transformed = cv2.warpPerspective(image, matrix, (w, h))
+    return transformed
+
+class CustomAugmentations:
+    """SAME AUGMENTATIONS AS RGB VERSION"""
+    def __init__(self, is_training=True):
+        self.is_training = is_training
+    
+    def __call__(self, image):
+        if not self.is_training:
+            return image
+        
+        if isinstance(image, Image.Image):
+            image = np.array(image)
+        
+        # Apply augmentations with same probabilities as RGB
+        if random.random() < 0.5:
+            image = cv2.flip(image, 1)
+        
+        if random.random() < 0.5:
+            image = cv2.flip(image, 0)
+        
+        if random.random() < 0.7:
+            angle = random.uniform(0, 360)
+            h, w = image.shape[:2]
+            center = (w // 2, h // 2)
+            matrix = cv2.getRotationMatrix2D(center, angle, 1.0)
+            image = cv2.warpAffine(image, matrix, (w, h))
+        
+        if random.random() < 0.5:
+            zoom_factor = random.uniform(1.0, 1.35)
+            h, w = image.shape[:2]
+            new_h, new_w = int(h * zoom_factor), int(w * zoom_factor)
+            
+            resized = cv2.resize(image, (new_w, new_h))
+            
+            if zoom_factor > 1.0:
+                start_x = (new_w - w) // 2
+                start_y = (new_h - h) // 2
+                image = resized[start_y:start_y+h, start_x:start_x+w]
+            else:
+                pad_x = (w - new_w) // 2
+                pad_y = (h - new_h) // 2
+                image = cv2.copyMakeBorder(resized, pad_y, pad_y, pad_x, pad_x, cv2.BORDER_CONSTANT)
+        
+        if random.random() < 0.3:
+            image = apply_perspective_transform(image)
+        
+        return image
+
+class EnhancedTransforms:
+    """
+    Enhanced transforms for RG images - MATCHING RGB AUGMENTATIONS
+    """
+    def __init__(self, size=384, mean=None, std=None, is_training=True):
+        self.size = size
+        self.mean = mean or [0.5, 0.5]
+        self.std = std or [0.5, 0.5]
+        self.is_training = is_training
+        
+        if is_training:
+            self.augmentation = CustomAugmentations(is_training=True)
+        else:
+            self.augmentation = CustomAugmentations(is_training=False)
+    
+    def __call__(self, image):
+        if isinstance(image, Image.Image):
+            image = np.array(image)
+        
+        # Apply augmentations
+        image = self.augmentation(image)
+        
+        # Convert to PIL for final processing
+        if isinstance(image, np.ndarray):
+            image = Image.fromarray(image)
+        
+        # Convert to tensor and normalize
+        image = transforms.ToTensor()(image)
+        
+        # Apply RG-specific normalization
+        for i in range(2):
+            image[i] = (image[i] - self.mean[i]) / self.std[i]
+        
+        return image
+
+def get_enhanced_transforms(rg_mean, rg_std, image_size=384):
+    """
+    Get enhanced transforms for RG channels
+    """
+    train_transforms = EnhancedTransforms(
+        size=image_size, 
+        mean=rg_mean, 
+        std=rg_std, 
+        is_training=True
+    )
+    val_transforms = EnhancedTransforms(
+        size=image_size, 
+        mean=rg_mean, 
+        std=rg_std, 
+        is_training=False
+    )
+    
+    return train_transforms, val_transforms
+
+class RGResNeXtModel(nn.Module):
+    """
+    RG Channel SE-ResNeXt model - SAME ARCHITECTURE AS RGB VERSION
+    """
+    def __init__(self, num_classes=5, dropout_rate=0.5, model_name='seresnext26d_32x4d'):
+        super(RGResNeXtModel, self).__init__()
+        
+        # Load pretrained SE-ResNeXt with 2 input channels
+        self.backbone = timm.create_model(
+            model_name, 
+            pretrained=True, 
+            num_classes=0,  # Remove classification head
+            in_chans=2      # 2 input channels for RG
+        )
+        feature_dim = self.backbone.num_features
+        
+        # SAME CLASSIFIER AS RGB VERSION
+        self.classifier = nn.Sequential(
+            nn.Dropout(dropout_rate),
+            nn.Linear(feature_dim, 1024),
+            nn.ReLU(inplace=True),
+            nn.Dropout(dropout_rate/2),
+            nn.Linear(1024, 512),
+            nn.ReLU(inplace=True),
+            nn.Dropout(dropout_rate/2),
+            nn.Linear(512, num_classes)
+        )
+        
+        # Initialize new layers
+        for m in self.classifier.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight)
+                nn.init.constant_(m.bias, 0)
+        
+        print(f"RG SE-ResNeXt Model: {sum(p.numel() for p in self.parameters()):,} parameters")
+        print(f"Input channels: 2 (RG), Resolution: 384x384")
+    
+    def forward(self, x):
+        features = self.backbone(x)
+        output = self.classifier(features)
+        return output
+
+def quadratic_weighted_kappa(y_true, y_pred):
+    return cohen_kappa_score(y_true, y_pred, weights='quadratic')
+
+def train_rg_seresnext_model(model, train_loader, val_loader, num_epochs=40, learning_rate=1e-4):
+    """
+    Train RG SE-ResNeXt model with SAME hyperparameters as RGB
+    """
+    criterion = nn.CrossEntropyLoss(label_smoothing=0.1)  # SAME AS RGB
+    
+    # Optimizer with same settings
+    backbone_params = list(model.backbone.parameters())
+    classifier_params = list(model.classifier.parameters())
+    
+    optimizer = optim.AdamW([
+        {'params': backbone_params, 'lr': learning_rate * 0.1, 'weight_decay': 1e-4},
+        {'params': classifier_params, 'lr': learning_rate, 'weight_decay': 1e-4}
+    ])
+    
+    # SAME scheduler as RGB
+    scheduler = optim.lr_scheduler.OneCycleLR(
+        optimizer, 
+        max_lr=learning_rate,
+        steps_per_epoch=len(train_loader),
+        epochs=num_epochs,
+        pct_start=0.3,
+        anneal_strategy='cos'
+    )
+    
+    history = {
+        'train_losses': [], 'val_losses': [], 'val_kappas': [], 
+        'val_accuracies': [], 'learning_rates': []
+    }
+    
+    best_kappa = 0.0
+    patience = 15
+    patience_counter = 0
+    
+    print("Starting RG SE-ResNeXt Training...")
+    print(f"Training on {len(train_loader.dataset)} samples")
+    print(f"Validating on {len(val_loader.dataset)} samples")
+    print(f"Image size: 384x384")
+    print(f"Architecture: SE-ResNeXt-26x4d (RG channels only)")
+    
+    for epoch in range(num_epochs):
+        # Training
+        model.train()
+        train_loss = 0.0
+        train_correct = 0
+        train_total = 0
+        
+        train_pbar = tqdm(train_loader, desc=f'Epoch {epoch+1}/{num_epochs} [RG Train]')
+        
+        for data, target in train_pbar:
+            data, target = data.to(device), target.to(device)
+            
+            if data.size(0) == 1:
+                continue
+            
+            optimizer.zero_grad()
+            output = model(data)
+            loss = criterion(output, target)
+            loss.backward()
+            
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            optimizer.step()
+            scheduler.step()
+            
+            train_loss += loss.item()
+            pred = output.argmax(dim=1, keepdim=True)
+            train_correct += pred.eq(target.view_as(pred)).sum().item()
+            train_total += target.size(0)
+            
+            current_acc = 100. * train_correct / train_total
+            train_pbar.set_postfix({
+                'Loss': f'{loss.item():.4f}',
+                'Acc': f'{current_acc:.2f}%',
+                'LR': f'{scheduler.get_last_lr()[0]:.2e}'
+            })
+        
+        avg_train_loss = train_loss / len(train_loader)
+        train_accuracy = 100. * train_correct / train_total
+        
+        # Validation
+        model.eval()
+        val_loss = 0.0
+        val_correct = 0
+        val_total = 0
+        all_preds = []
+        all_targets = []
+        
+        with torch.no_grad():
+            for data, target in val_loader:
+                data, target = data.to(device), target.to(device)
+                
+                if data.size(0) == 1:
+                    continue
+                    
+                output = model(data)
+                loss = criterion(output, target)
+                val_loss += loss.item()
+                
+                pred = output.argmax(dim=1, keepdim=True)
+                val_correct += pred.eq(target.view_as(pred)).sum().item()
+                val_total += target.size(0)
+                
+                all_preds.extend(pred.cpu().numpy().flatten())
+                all_targets.extend(target.cpu().numpy())
+        
+        avg_val_loss = val_loss / len(val_loader)
+        val_accuracy = 100. * val_correct / val_total
+        val_kappa = quadratic_weighted_kappa(all_targets, all_preds)
+        
+        current_lr = scheduler.get_last_lr()[0]
+        
+        history['train_losses'].append(avg_train_loss)
+        history['val_losses'].append(avg_val_loss)
+        history['val_kappas'].append(val_kappa)
+        history['val_accuracies'].append(val_accuracy)
+        history['learning_rates'].append(current_lr)
+        
+        print(f'Epoch {epoch+1}: Train Loss: {avg_train_loss:.4f}, Val Loss: {avg_val_loss:.4f}')
+        print(f'Val Acc: {val_accuracy:.2f}%, Val QWK: {val_kappa:.4f}')
+        
+        if val_kappa > best_kappa:
+            best_kappa = val_kappa
+            torch.save(model.state_dict(), 'best_rg_seresnext_model.pth')
+            patience_counter = 0
+            print(f'✅ New best RG model! QWK: {best_kappa:.4f}')
+        else:
+            patience_counter += 1
+            
+        if patience_counter >= patience:
+            print(f'Early stopping at epoch {epoch+1}')
+            break
+    
+    history['best_kappa'] = best_kappa
+    history['total_epochs'] = epoch + 1
+    
+    return model, history
+
+def main():
+    """Main training function"""
+    config = {
+        'train_csv': '/kaggle/input/aptos2019-blindness-detection/train.csv',
+        'train_img_dir': '/kaggle/input/aptos2019-blindness-detection/train_images',
+        'batch_size': 16,
+        'num_epochs': 40,
+        'learning_rate': 1e-4,
+        'num_classes': 5,
+        'dropout_rate': 0.5,
+        'val_split': 0.2,
+        'model_name': 'seresnext26d_32x4d',
+        'image_size': 384  # SAME AS RGB
+    }
+    
+    print("="*70)
+    print("RG SE-RESNEXT DIABETIC RETINOPATHY MODEL")
+    print("="*70)
+    print("Key Features (Matching RGB Setup):")
+    print(f"  - Single-stream {config['model_name']} (RG channels only)")
+    print("  - Pretrained weights adapted for 2-channel input")
+    print("  - Squeeze-and-Excitation attention mechanism")
+    print("  - Black background cropping")
+    print("  - Enhanced augmentations matching RGB")
+    print("  - Label smoothing + OneCycleLR")
+    print(f"  - Image resolution: {config['image_size']}x{config['image_size']}")
+    print("="*70)
+    
+    # Calculate RG normalization stats at TRAINING resolution
+    rg_mean, rg_std = calculate_rg_normalization_stats(
+        config['train_csv'], 
+        config['train_img_dir'], 
+        sample_size=500,
+        image_size=config['image_size']  # USE TRAINING SIZE
+    )
+    
+    # Get enhanced transforms matching RGB
+    train_transforms, val_transforms = get_enhanced_transforms(
+        rg_mean, rg_std, config['image_size']
+    )
+    
+    # Load training data
+    print("\nLoading RG training data...")
+    full_train_dataset = DiabeticRetinopathyRGDataset(
+        csv_file=config['train_csv'],
+        img_dir=config['train_img_dir'],
+        transform=train_transforms,
+        image_size=config['image_size']
+    )
+    
+    # Split into train and validation
+    train_size = int(0.8 * len(full_train_dataset))
+    val_size = len(full_train_dataset) - train_size
+    train_dataset, val_dataset = torch.utils.data.random_split(
+        full_train_dataset, [train_size, val_size],
+        generator=torch.Generator().manual_seed(42)
+    )
+    
+    # Create data loaders
+    train_loader = DataLoader(
+        train_dataset, 
+        batch_size=config['batch_size'], 
+        shuffle=True, 
+        num_workers=4,
+        pin_memory=True,
+        drop_last=True
+    )
+    val_loader = DataLoader(
+        val_dataset, 
+        batch_size=config['batch_size'], 
+        shuffle=False, 
+        num_workers=4,
+        pin_memory=True,
+        drop_last=False
+    )
+    
+    # Initialize model
+    print(f"\nInitializing {config['model_name']} RG model...")
+    model = RGResNeXtModel(
+        num_classes=config['num_classes'],
+        dropout_rate=config['dropout_rate'],
+        model_name=config['model_name']
+    )
+    model.to(device)
+    
+    # Train model
+    print(f"\nStarting {config['model_name']} RG model training...")
+    model, history = train_rg_seresnext_model(
+        model, 
+        train_loader, 
+        val_loader, 
+        num_epochs=config['num_epochs'],
+        learning_rate=config['learning_rate']
+    )
+    
+    print(f"\nRG Training Completed!")
+    print(f"Best QWK: {history['best_kappa']:.4f}")
+    print(f"Total epochs: {history['total_epochs']}")
+    
+    # Save results
+    results = {
+        'model_type': 'RG Channel SE-ResNeXt',
+        'architecture': config['model_name'],
+        'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+        'best_qwk': float(history['best_kappa']),
+        'total_epochs': int(history['total_epochs']),
+        'rg_normalization': {'mean': rg_mean, 'std': rg_std},
+        'image_size': config['image_size'],
+        'config': config
+    }
+    
+    with open('rg_seresnext_training_results.json', 'w') as f:
+        json.dump(results, f, indent=2)
+    
+    # Save normalization stats
+    norm_stats = {'rg_mean': rg_mean, 'rg_std': rg_std, 'image_size': config['image_size']}
+    with open('rg_seresnext_normalization_stats.json', 'w') as f:
+        json.dump(norm_stats, f, indent=2)
+    
+    print(f"Results saved to 'rg_seresnext_training_results.json'")
+    print(f"Normalization stats saved to 'rg_seresnext_normalization_stats.json'")
+    
+    return model, history, rg_mean, rg_std
+
+if __name__ == "__main__":
+    # Set random seeds for reproducibility
+    torch.manual_seed(42)
+    np.random.seed(42)
+    random.seed(42)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+    
+    # Run RG experiment
+    model, history, rg_mean, rg_std = main()
