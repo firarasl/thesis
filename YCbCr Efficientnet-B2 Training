@@ -1,0 +1,683 @@
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader
+import torchvision.transforms as transforms
+from torchvision import models
+import pandas as pd
+import numpy as np
+import cv2
+from PIL import Image
+import os
+from sklearn.metrics import cohen_kappa_score, confusion_matrix, classification_report
+from sklearn.model_selection import train_test_split
+import matplotlib.pyplot as plt
+import seaborn as sns
+from tqdm import tqdm
+import warnings
+import json
+from datetime import datetime
+warnings.filterwarnings('ignore')
+
+# Set device
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+print(f"Using device: {device}")
+
+class DiabeticRetinopathyYCbCrDataset(Dataset):
+    """
+    Custom Dataset for Diabetic Retinopathy with YCbCr color space
+    Y (luma): brightness information
+    Cb: blue-difference chroma component
+    Cr: red-difference chroma component
+    """
+    def __init__(self, csv_file, img_dir, transform=None, is_test=False):
+        """
+        Args:
+            csv_file (string): Path to csv with image names and labels
+            img_dir (string): Directory with all images
+            transform (callable, optional): Transform to be applied on images
+            is_test (bool): Whether this is test dataset (no labels)
+        """
+        self.data = pd.read_csv(csv_file)
+        self.img_dir = img_dir
+        self.transform = transform
+        self.is_test = is_test
+        
+        # Print dataset statistics
+        if not is_test:
+            print(f"Dataset loaded: {len(self.data)} images")
+            label_counts = self.data.iloc[:, 1].value_counts().sort_index()
+            print("Label distribution:")
+            for label, count in label_counts.items():
+                print(f"  Class {label}: {count} images ({count/len(self.data)*100:.1f}%)")
+        
+    def __len__(self):
+        return len(self.data)
+    
+    def rgb_to_ycbcr(self, rgb_image):
+        """
+        Convert RGB image to YCbCr color space using OpenCV
+        """
+        # Convert PIL Image to numpy array if needed
+        if isinstance(rgb_image, Image.Image):
+            rgb_array = np.array(rgb_image)
+        else:
+            rgb_array = rgb_image
+            
+        # Convert RGB to YCbCr using OpenCV
+        ycbcr_array = cv2.cvtColor(rgb_array, cv2.COLOR_RGB2YCrCb)
+        
+        # Note: OpenCV returns YCrCb, but we want YCbCr, so we need to swap channels
+        # YCrCb has channels: Y, Cr, Cb
+        # YCbCr has channels: Y, Cb, Cr
+        # So we need to swap the last two channels
+        y_channel = ycbcr_array[:, :, 0]
+        cr_channel = ycbcr_array[:, :, 1]  # This is Cr
+        cb_channel = ycbcr_array[:, :, 2]  # This is Cb
+        
+        # Rearrange to YCbCr format
+        ycbcr_correct = np.stack([y_channel, cb_channel, cr_channel], axis=2)
+        
+        return Image.fromarray(ycbcr_correct)
+    
+    def __getitem__(self, idx):
+        if torch.is_tensor(idx):
+            idx = idx.tolist()
+            
+        # Get image name
+        img_name = self.data.iloc[idx, 0]  # Assuming first column is image name
+        
+        # Try different extensions
+        img_extensions = ['.jpeg', '.jpg', '.png']
+        img_path = None
+        
+        for ext in img_extensions:
+            potential_path = os.path.join(self.img_dir, f"{img_name}{ext}")
+            if os.path.exists(potential_path):
+                img_path = potential_path
+                break
+                
+        if img_path is None:
+            raise FileNotFoundError(f"Image {img_name} not found with any extension")
+        
+        # Load image in RGB format first
+        image = cv2.imread(img_path)
+        if image is None:
+            raise ValueError(f"Could not load image: {img_path}")
+        
+        # Convert BGR (OpenCV default) to RGB
+        image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        
+        # Convert to PIL Image
+        image = Image.fromarray(image)
+        
+        # Convert RGB to YCbCr
+        image = self.rgb_to_ycbcr(image)
+        
+        if self.transform:
+            image = self.transform(image)
+            
+        if not self.is_test:
+            label = int(self.data.iloc[idx, 1])  # Assuming second column is label
+            return image, label
+        else:
+            return image, img_name
+
+class DREfficientNetB2Classifier(nn.Module):
+    """
+    Diabetic Retinopathy Classifier using EfficientNet-B2 adapted for YCbCr images
+    """
+    def __init__(self, num_classes=5, pretrained=True, dropout_rate=0.5):
+        super(DREfficientNetB2Classifier, self).__init__()
+        
+        # Use EfficientNet-B2 as backbone
+        self.backbone = models.efficientnet_b2(pretrained=pretrained)
+        
+        # Modify first convolution layer to accept YCbCr (3 channels) instead of RGB
+        if pretrained:
+            # Get the original first convolution layer
+            original_conv = self.backbone.features[0][0]
+            
+            # Create new first convolution layer for YCbCr
+            new_conv = nn.Conv2d(
+                3,  # YCbCr has 3 channels
+                original_conv.out_channels,
+                kernel_size=original_conv.kernel_size,
+                stride=original_conv.stride,
+                padding=original_conv.padding,
+                bias=False
+            )
+            
+            # Initialize weights for YCbCr channels
+            original_weight = original_conv.weight.clone()
+            
+            # Y channel: average of RGB channels (luminance is similar to grayscale)
+            new_conv.weight.data[:, 0, :, :] = original_weight.mean(dim=1)
+            
+            # Cb channel: initialize with blue channel weights
+            new_conv.weight.data[:, 1, :, :] = original_weight[:, 2, :, :]
+            
+            # Cr channel: initialize with red channel weights  
+            new_conv.weight.data[:, 2, :, :] = original_weight[:, 0, :, :]
+            
+            # Replace the first convolution layer
+            self.backbone.features[0][0] = new_conv
+        
+        # Store original classifier input features
+        num_features = self.backbone.classifier[1].in_features
+        
+        # Replace final classifier with custom classifier
+        self.backbone.classifier = nn.Sequential(
+            nn.Dropout(p=dropout_rate),
+            nn.Linear(num_features, 1024),
+            nn.ReLU(inplace=True),
+            nn.Dropout(p=dropout_rate/2),
+            nn.Linear(1024, 512),
+            nn.ReLU(inplace=True),
+            nn.Dropout(p=dropout_rate/3, inplace=True),
+            nn.Linear(512, num_classes)
+        )
+        
+        # Initialize weights for new layers
+        for m in self.backbone.classifier.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight)
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0)
+        
+    def forward(self, x):
+        return self.backbone(x)
+
+def get_ycbcr_transforms():
+    """
+    Define data augmentation and preprocessing transforms optimized for YCbCr images
+    """
+    # Custom normalization values for YCbCr color space
+    # These values are approximated based on typical YCbCr distributions
+    ycbcr_mean = [0.5, 0.5, 0.5]  # Normalized to [0,1] range
+    ycbcr_std = [0.25, 0.25, 0.25]  # Conservative standard deviation
+    
+    # Enhanced augmentations for medical imaging with YCbCr considerations
+    train_transforms = transforms.Compose([
+        transforms.Resize((512, 512)),
+        transforms.RandomHorizontalFlip(p=0.5),
+        transforms.RandomVerticalFlip(p=0.5),
+        transforms.RandomRotation(degrees=15),
+        transforms.RandomAffine(degrees=0, translate=(0.05, 0.05)),
+        transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.05),
+        transforms.RandomResizedCrop(512, scale=(0.8, 1.0)),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=ycbcr_mean, std=ycbcr_std)
+    ])
+    
+    val_transforms = transforms.Compose([
+        transforms.Resize((512, 512)),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=ycbcr_mean, std=ycbcr_std)
+    ])
+    
+    return train_transforms, val_transforms
+
+def quadratic_weighted_kappa(y_true, y_pred):
+    """
+    Calculate Quadratic Weighted Kappa (QWK) score
+    This is the primary evaluation metric for the Kaggle competition
+    """
+    return cohen_kappa_score(y_true, y_pred, weights='quadratic')
+
+def train_efficientnet_model(model, train_loader, val_loader, num_epochs=60, learning_rate=1e-4):
+    """
+    Train the EfficientNet-B2 diabetic retinopathy model with advanced training techniques
+    """
+    # Loss function with class weights for imbalanced dataset
+    criterion = nn.CrossEntropyLoss()
+    
+    # Optimizer with weight decay
+    optimizer = optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=1e-4)
+    
+    # Learning rate scheduler
+    scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(
+        optimizer, T_0=10, T_mult=2, eta_min=1e-6
+    )
+    
+    # Training history
+    history = {
+        'train_losses': [],
+        'val_losses': [],
+        'val_kappas': [],
+        'val_accuracies': [],
+        'learning_rates': []
+    }
+    
+    best_kappa = 0.0
+    best_model_state = None
+    patience_counter = 0
+    patience = 15
+    
+    print("Starting EfficientNet-B2 Model Training...")
+    print(f"Training on {len(train_loader.dataset)} samples")
+    print(f"Validating on {len(val_loader.dataset)} samples")
+    
+    for epoch in range(num_epochs):
+        # Training phase
+        model.train()
+        train_loss = 0.0
+        train_correct = 0
+        train_total = 0
+        
+        train_pbar = tqdm(train_loader, desc=f'Epoch {epoch+1}/{num_epochs} [Train]')
+        
+        for batch_idx, (data, target) in enumerate(train_pbar):
+            data, target = data.to(device), target.to(device)
+            
+            optimizer.zero_grad()
+            output = model(data)
+            loss = criterion(output, target)
+            loss.backward()
+            
+            # Gradient clipping
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            
+            optimizer.step()
+            
+            train_loss += loss.item()
+            pred = output.argmax(dim=1, keepdim=True)
+            train_correct += pred.eq(target.view_as(pred)).sum().item()
+            train_total += target.size(0)
+            
+            # Update progress bar
+            current_acc = 100. * train_correct / train_total
+            train_pbar.set_postfix({
+                'Loss': f'{loss.item():.4f}',
+                'Acc': f'{current_acc:.2f}%'
+            })
+        
+        avg_train_loss = train_loss / len(train_loader)
+        train_accuracy = 100. * train_correct / train_total
+        
+        # Validation phase
+        model.eval()
+        val_loss = 0.0
+        val_correct = 0
+        val_total = 0
+        all_preds = []
+        all_targets = []
+        
+        with torch.no_grad():
+            val_pbar = tqdm(val_loader, desc=f'Epoch {epoch+1}/{num_epochs} [Val]')
+            for data, target in val_pbar:
+                data, target = data.to(device), target.to(device)
+                output = model(data)
+                loss = criterion(output, target)
+                val_loss += loss.item()
+                
+                # Get predictions
+                pred = output.argmax(dim=1, keepdim=True)
+                val_correct += pred.eq(target.view_as(pred)).sum().item()
+                val_total += target.size(0)
+                
+                all_preds.extend(pred.cpu().numpy().flatten())
+                all_targets.extend(target.cpu().numpy())
+                
+                current_acc = 100. * val_correct / val_total
+                val_pbar.set_postfix({
+                    'Loss': f'{loss.item():.4f}',
+                    'Acc': f'{current_acc:.2f}%'
+                })
+        
+        avg_val_loss = val_loss / len(val_loader)
+        val_accuracy = 100. * val_correct / val_total
+        val_kappa = quadratic_weighted_kappa(all_targets, all_preds)
+        
+        # Update learning rate
+        scheduler.step()
+        current_lr = optimizer.param_groups[0]['lr']
+        
+        # Store history
+        history['train_losses'].append(avg_train_loss)
+        history['val_losses'].append(avg_val_loss)
+        history['val_kappas'].append(val_kappa)
+        history['val_accuracies'].append(val_accuracy)
+        history['learning_rates'].append(current_lr)
+        
+        # Print epoch results
+        print(f'\nEpoch {epoch+1}/{num_epochs}:')
+        print(f'  Train Loss: {avg_train_loss:.4f} | Train Acc: {train_accuracy:.2f}%')
+        print(f'  Val Loss: {avg_val_loss:.4f} | Val Acc: {val_accuracy:.2f}%')
+        print(f'  Val QWK: {val_kappa:.4f}')
+        print(f'  Learning Rate: {current_lr:.8f}')
+        
+        # Save best model and early stopping
+        if val_kappa > best_kappa:
+            best_kappa = val_kappa
+            best_model_state = model.state_dict().copy()
+            torch.save(best_model_state, 'best_efficientnetb2_model.pth')
+            patience_counter = 0
+            print(f'  ✅ New best model saved! QWK: {best_kappa:.4f}')
+        else:
+            patience_counter += 1
+            
+        if patience_counter >= patience:
+            print(f'\nEarly stopping triggered after {patience} epochs without improvement.')
+            break
+            
+        print('-' * 70)
+    
+    # Load best model
+    if best_model_state is not None:
+        model.load_state_dict(best_model_state)
+    
+    history['best_kappa'] = best_kappa
+    history['total_epochs'] = epoch + 1
+    
+    return model, history
+
+def evaluate_efficientnet_model(model, test_loader, save_predictions=True):
+    """
+    Evaluate EfficientNet-B2 model on test set and generate Kaggle predictions
+    """
+    model.eval()
+    predictions = []
+    image_names = []
+    
+    print("Generating EfficientNet-B2 model predictions...")
+    with torch.no_grad():
+        for data, names in tqdm(test_loader):
+            data = data.to(device)
+            outputs = model(data)
+            
+            # Use softmax probabilities for more confident predictions
+            probs = torch.softmax(outputs, dim=1)
+            preds = probs.argmax(dim=1)
+            
+            predictions.extend(preds.cpu().numpy())
+            image_names.extend(names)
+    
+    if save_predictions:
+        # Create submission file
+        submission_df = pd.DataFrame({
+            'id_code': image_names,
+            'diagnosis': predictions
+        })
+        submission_df.to_csv('efficientnetb2_predictions.csv', index=False)
+        print("EfficientNet-B2 predictions saved to 'efficientnetb2_predictions.csv'")
+    
+    return predictions, image_names
+
+def validate_with_confusion_matrix(model, val_loader):
+    """
+    Generate detailed validation metrics including confusion matrix
+    """
+    model.eval()
+    all_preds = []
+    all_targets = []
+    
+    with torch.no_grad():
+        for data, target in tqdm(val_loader, desc="Generating validation metrics"):
+            data, target = data.to(device), target.to(device)
+            output = model(data)
+            pred = output.argmax(dim=1)
+            
+            all_preds.extend(pred.cpu().numpy())
+            all_targets.extend(target.cpu().numpy())
+    
+    # Calculate metrics
+    qwk = quadratic_weighted_kappa(all_targets, all_preds)
+    cm = confusion_matrix(all_targets, all_preds)
+    
+    # Plot confusion matrix
+    plt.figure(figsize=(10, 8))
+    sns.heatmap(cm, annot=True, fmt='d', cmap='Blues',
+                xticklabels=['No DR', 'Mild', 'Moderate', 'Severe', 'Proliferative'],
+                yticklabels=['No DR', 'Mild', 'Moderate', 'Severe', 'Proliferative'])
+    plt.title(f'EfficientNet-B2 Model Confusion Matrix (QWK: {qwk:.4f})')
+    plt.ylabel('True Label')
+    plt.xlabel('Predicted Label')
+    plt.tight_layout()
+    plt.savefig('efficientnetb2_confusion_matrix.png', dpi=300, bbox_inches='tight')
+    plt.show()
+    
+    # Classification report
+    class_names = ['No DR', 'Mild', 'Moderate', 'Severe', 'Proliferative']
+    report = classification_report(all_targets, all_preds, target_names=class_names)
+    print("\nClassification Report:")
+    print(report)
+    
+    return qwk, cm, report
+
+def plot_efficientnet_training_history(history):
+    """
+    Plot comprehensive training history for EfficientNet-B2 model
+    """
+    fig, ((ax1, ax2), (ax3, ax4)) = plt.subplots(2, 2, figsize=(15, 12))
+    
+    # Plot losses
+    ax1.plot(history['train_losses'], label='Training Loss', color='blue')
+    ax1.plot(history['val_losses'], label='Validation Loss', color='orange')
+    ax1.set_title('EfficientNet-B2 Model: Training and Validation Loss')
+    ax1.set_xlabel('Epoch')
+    ax1.set_ylabel('Loss')
+    ax1.legend()
+    ax1.grid(True)
+    
+    # Plot QWK
+    ax2.plot(history['val_kappas'], label='Validation QWK', color='green', linewidth=2)
+    ax2.axhline(y=0.889, color='red', linestyle='--', label='Target QWK (0.889)', linewidth=2)
+    ax2.set_title('EfficientNet-B2 Model: Validation Quadratic Weighted Kappa')
+    ax2.set_xlabel('Epoch')
+    ax2.set_ylabel('QWK Score')
+    ax2.legend()
+    ax2.grid(True)
+    
+    # Plot accuracies
+    ax3.plot(history['val_accuracies'], label='Validation Accuracy', color='purple')
+    ax3.set_title('EfficientNet-B2 Model: Validation Accuracy')
+    ax3.set_xlabel('Epoch')
+    ax3.set_ylabel('Accuracy (%)')
+    ax3.legend()
+    ax3.grid(True)
+    
+    # Plot learning rate
+    ax4.plot(history['learning_rates'], label='Learning Rate', color='brown')
+    ax4.set_title('EfficientNet-B2 Model: Learning Rate Schedule')
+    ax4.set_xlabel('Epoch')
+    ax4.set_ylabel('Learning Rate')
+    ax4.set_yscale('log')
+    ax4.legend()
+    ax4.grid(True)
+    
+    plt.tight_layout()
+    plt.savefig('efficientnetb2_training_history.png', dpi=300, bbox_inches='tight')
+    plt.show()
+    
+    # Print final results
+    print(f"\n{'='*70}")
+    print("EFFICIENTNET-B2 MODEL TRAINING RESULTS")
+    print(f"{'='*70}")
+    print(f"Best QWK Score: {history['best_kappa']:.4f}")
+    print(f"Total Epochs: {history['total_epochs']}")
+    print(f"Final Validation Accuracy: {history['val_accuracies'][-1]:.2f}%")
+    
+    if history['best_kappa'] > 0.889:
+        print("✅ Target QWK score (>0.889) achieved!")
+    else:
+        print("❌ Target QWK score (>0.889) not yet achieved.")
+        print(f"   Gap to target: {0.889 - history['best_kappa']:.4f}")
+
+def main():
+    """
+    Main training pipeline for EfficientNet-B2 DR classification
+    """
+    # Configuration
+    config = {
+        'train_csv': '/kaggle/input/aptos2019-blindness-detection/train.csv',
+        'test_csv': '/kaggle/input/aptos2019-blindness-detection/test.csv',
+        'train_img_dir': '/kaggle/input/aptos2019-blindness-detection/train_images',
+        'test_img_dir': '/kaggle/input/aptos2019-blindness-detection/test_images',
+        'batch_size': 16,
+        'num_epochs': 40,
+        'learning_rate': 1e-4,
+        'num_classes': 5,
+        'dropout_rate': 0.5
+    }
+    
+    print("="*70)
+    print("DIABETIC RETINOPATHY EFFICIENTNET-B2 MODEL - EXPERIMENT 2.4")
+    print("="*70)
+    print("Configuration:")
+    for key, value in config.items():
+        print(f"  {key}: {value}")
+    print("="*70)
+    
+    # Get YCbCr-specific transforms
+    train_transforms, val_transforms = get_ycbcr_transforms()
+    
+    # Load training data
+    print("\nLoading YCbCr training data...")
+    full_train_dataset = DiabeticRetinopathyYCbCrDataset(
+        csv_file=config['train_csv'],
+        img_dir=config['train_img_dir'],
+        transform=train_transforms
+    )
+    
+    # Split into train and validation (80/20)
+    train_size = int(0.8 * len(full_train_dataset))
+    val_size = len(full_train_dataset) - train_size
+    train_dataset, val_dataset = torch.utils.data.random_split(
+        full_train_dataset, [train_size, val_size],
+        generator=torch.Generator().manual_seed(42)
+    )
+    
+    # Create separate dataset instance for validation with different transforms
+    val_dataset_copy = DiabeticRetinopathyYCbCrDataset(
+        csv_file=config['train_csv'],
+        img_dir=config['train_img_dir'],
+        transform=val_transforms
+    )
+    
+    # Create data loaders
+    train_loader = DataLoader(
+        train_dataset, 
+        batch_size=config['batch_size'], 
+        shuffle=True, 
+        num_workers=4,
+        pin_memory=True
+    )
+    val_loader = DataLoader(
+        val_dataset, 
+        batch_size=config['batch_size'], 
+        shuffle=False, 
+        num_workers=4,
+        pin_memory=True
+    )
+    
+    # Load test data
+    test_dataset = DiabeticRetinopathyYCbCrDataset(
+        csv_file=config['test_csv'],
+        img_dir=config['test_img_dir'],
+        transform=val_transforms,
+        is_test=True
+    )
+    test_loader = DataLoader(
+        test_dataset, 
+        batch_size=config['batch_size'], 
+        shuffle=False, 
+        num_workers=4,
+        pin_memory=True
+    )
+    
+    # Initialize EfficientNet-B2 model
+    print("\nInitializing EfficientNet-B2 model...")
+    model = DREfficientNetB2Classifier(
+        num_classes=config['num_classes'],
+        dropout_rate=config['dropout_rate']
+    )
+    model.to(device)
+    
+    # Print model information
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"Total parameters: {total_params:,}")
+    print(f"Trainable parameters: {trainable_params:,}")
+    
+    # Train EfficientNet-B2 model
+    print("\nStarting EfficientNet-B2 model training...")
+    model, history = train_efficientnet_model(
+        model, 
+        train_loader, 
+        val_loader, 
+        num_epochs=config['num_epochs'],
+        learning_rate=config['learning_rate']
+    )
+    
+    # Plot training history
+    plot_efficientnet_training_history(history)
+    
+    # Detailed validation analysis
+    print("\nPerforming detailed validation analysis...")
+    final_qwk, cm, report = validate_with_confusion_matrix(model, val_loader)
+    
+    # Generate test predictions
+    print("\nGenerating test predictions...")
+    predictions, image_names = evaluate_efficientnet_model(model, test_loader)
+    
+    # Compile final results
+    results = {
+        'experiment': 'EfficientNet-B2 Model (2.4) - Color Space Experiment',
+        'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+        'best_qwk': float(history['best_kappa']),
+        'final_validation_qwk': float(final_qwk),
+        'total_epochs': int(history['total_epochs']),
+        'model_architecture': 'EfficientNet-B2 + Custom Classifier (YCbCr adapted)',
+        'input_type': 'YCbCr (3-channel: Y, Cb, Cr)',
+        'preprocessing': 'RGB→YCbCr conversion with custom normalization',
+        'image_size': '512x512',
+        'batch_size': config['batch_size'],
+        'learning_rate': config['learning_rate'],
+        'optimizer': 'AdamW with CosineAnnealingWarmRestarts',
+        'augmentations': 'Flip, Rotation, Affine, ColorJitter, ResizedCrop',
+        'target_achieved': bool(history['best_kappa'] > 0.889),
+        'model_advantages': [
+            'EfficientNet-B2 is more parameter-efficient than ResNet-50',
+            'Better feature extraction with compound scaling',
+            'Improved performance with fewer parameters',
+            'Mobile-friendly architecture'
+        ]
+    }
+    
+    # Save results
+    with open('efficientnetb2_experiment_results.json', 'w') as f:
+        json.dump(results, f, indent=2)
+    
+    # Print final summary
+    print("\n" + "="*70)
+    print("EFFICIENTNET-B2 MODEL EXPERIMENT 2.4 - FINAL RESULTS SUMMARY")
+    print("="*70)
+    for key, value in results.items():
+        if key != 'model_advantages':
+            print(f"{key}: {value}")
+    print("\nEfficientNet-B2 Advantages:")
+    for advantage in results['model_advantages']:
+        print(f"  • {advantage}")
+    print("="*70)
+    
+    print(f"\nFiles saved:")
+    print(f"  - Model weights: 'best_efficientnetb2_model.pth'")
+    print(f"  - Predictions: 'efficientnetb2_predictions.csv'")
+    print(f"  - Training plots: 'efficientnetb2_training_history.png'")
+    print(f"  - Confusion matrix: 'efficientnetb2_confusion_matrix.png'")
+    print(f"  - Results: 'efficientnetb2_experiment_results.json'")
+    
+    return model, history, results
+
+if __name__ == "__main__":
+    # Set random seeds for reproducibility
+    torch.manual_seed(42)
+    np.random.seed(42)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+    
+    # Run EfficientNet-B2 experiment
+    model, history, results = main()
+
+
