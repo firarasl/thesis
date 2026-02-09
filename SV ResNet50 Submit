@@ -1,0 +1,438 @@
+import torch
+import torch.nn as nn
+from torch.utils.data import Dataset, DataLoader
+import torchvision.transforms as transforms
+from torchvision import models
+import pandas as pd
+import numpy as np
+import cv2
+from PIL import Image
+import os
+from tqdm import tqdm
+import warnings
+warnings.filterwarnings('ignore')
+
+# Set device
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+print(f"Using device: {device}")
+
+class DiabeticRetinopathyVSChannelDataset(Dataset):
+    """
+    Custom Dataset for Diabetic Retinopathy with VS (Value-Saturation) channels only
+    """
+    def __init__(self, csv_file, img_dir, transform=None, is_test=False):
+        """
+        Args:
+            csv_file (string): Path to csv with image names and labels
+            img_dir (string): Directory with all images
+            transform (callable, optional): Transform to be applied on images
+            is_test (bool): Whether this is test dataset (no labels)
+        """
+        self.data = pd.read_csv(csv_file)
+        self.img_dir = img_dir
+        self.transform = transform
+        self.is_test = is_test
+        
+        # Print dataset statistics
+        if not is_test:
+            print(f"VS Channel Dataset loaded: {len(self.data)} images")
+            print(f"Output channels: 2 (Value + Saturation)")
+            label_counts = self.data.iloc[:, 1].value_counts().sort_index()
+            print("Label distribution:")
+            for label, count in label_counts.items():
+                print(f"  Class {label}: {count} images ({count/len(self.data)*100:.1f}%)")
+        else:
+            print(f"Test Dataset loaded: {len(self.data)} images")
+            print(f"Output channels: 2 (Value + Saturation)")
+        
+    def __len__(self):
+        return len(self.data)
+    
+    def __getitem__(self, idx):
+        if torch.is_tensor(idx):
+            idx = idx.tolist()
+            
+        # Get image name
+        img_name = self.data.iloc[idx, 0]
+        
+        # Try different extensions
+        img_extensions = ['.jpeg', '.jpg', '.png']
+        img_path = None
+        
+        for ext in img_extensions:
+            potential_path = os.path.join(self.img_dir, f"{img_name}{ext}")
+            if os.path.exists(potential_path):
+                img_path = potential_path
+                break
+                
+        if img_path is None:
+            raise FileNotFoundError(f"Image {img_name} not found with any extension")
+        
+        # Load image
+        image = cv2.imread(img_path)
+        if image is None:
+            raise ValueError(f"Could not load image: {img_path}")
+        
+        # Convert BGR to RGB
+        image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        
+        # Convert RGB to HSV
+        image_hsv = cv2.cvtColor(image_rgb, cv2.COLOR_RGB2HSV)
+        
+        # Extract Value and Saturation channels (V and S)
+        image_vs = image_hsv[:, :, [2, 1]]  # V, S channels
+        
+        # Convert to PIL Image for transforms
+        image_pil = Image.fromarray(image_vs.astype('uint8'))
+        
+        if self.transform:
+            image_pil = self.transform(image_pil)
+            
+        if not self.is_test:
+            label = int(self.data.iloc[idx, 1])
+            return image_pil, label
+        else:
+            return image_pil, img_name
+
+class DRVSChannelClassifier(nn.Module):
+    """
+    Diabetic Retinopathy Classifier for VS (Value-Saturation) channels
+    """
+    def __init__(self, num_classes=5, pretrained=False, dropout_rate=0.5):
+        super(DRVSChannelClassifier, self).__init__()
+        
+        # Use ResNet50 as backbone
+        self.backbone = models.resnet50(pretrained=pretrained)
+        
+        # Modify first conv layer for 2 input channels (VS)
+        original_conv1 = self.backbone.conv1
+        
+        # Create new conv1 layer with 2 input channels
+        self.backbone.conv1 = nn.Conv2d(
+            2, 64, kernel_size=7, stride=2, padding=3, bias=False
+        )
+        
+        # Initialize new conv1 weights
+        if pretrained:
+            with torch.no_grad():
+                # Average pretrained RGB weights for VS channels initialization
+                # V (Value) is similar to brightness/intensity
+                # S (Saturation) represents color purity
+                rgb_weights = original_conv1.weight
+                
+                # Use Green channel for Value (brightness) and Red+Blue average for Saturation
+                green_weights = rgb_weights[:, 1:2, :, :]  # Green channel for Value
+                rb_weights = (rgb_weights[:, 0:1, :, :] + rgb_weights[:, 2:3, :, :]) / 2  # R+B avg for Saturation
+                
+                # Initialize with specialized weights for VS channels
+                self.backbone.conv1.weight = nn.Parameter(
+                    torch.cat([green_weights, rb_weights], dim=1)
+                )
+            print("Adapted pretrained weights for VS (Value-Saturation) channels")
+        else:
+            # Initialize with He initialization
+            nn.init.kaiming_normal_(self.backbone.conv1.weight, mode='fan_out', nonlinearity='relu')
+        
+        # Store original fc layer input features
+        num_features = self.backbone.fc.in_features
+        
+        # Replace final layer with custom classifier
+        self.backbone.fc = nn.Sequential(
+            nn.Dropout(dropout_rate),
+            nn.Linear(num_features, 512),
+            nn.ReLU(inplace=True),
+            nn.Dropout(dropout_rate/2),
+            nn.Linear(512, num_classes)
+        )
+        
+        # Initialize weights for new layers
+        for m in self.backbone.fc.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight)
+                nn.init.constant_(m.bias, 0)
+        
+    def forward(self, x):
+        return self.backbone(x)
+
+def get_vs_test_transforms():
+    """
+    Define test transforms for VS (Value-Saturation) channels
+    """
+    # Two-channel normalization for VS channels
+    # Value: 0-255 in OpenCV HSV, Saturation: 0-255
+    # Normalized values (approximate)
+    mean = [0.5, 0.4]  # V, S channel means (normalized)
+    std = [0.3, 0.25]  # V, S channel stds (normalized)
+    
+    test_transforms = transforms.Compose([
+        transforms.Resize((512, 512)),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=mean, std=std)
+    ])
+    
+    return test_transforms
+
+def load_model(model_path, num_classes=5, dropout_rate=0.5):
+    """
+    Load the trained VS model
+    """
+    print(f"Loading model from: {model_path}")
+    
+    # Initialize model architecture
+    model = DRVSChannelClassifier(
+        num_classes=num_classes,
+        pretrained=False,  # We're loading trained weights
+        dropout_rate=dropout_rate
+    )
+    
+    # Load trained weights
+    try:
+        model.load_state_dict(torch.load(model_path, map_location=device))
+        model.to(device)
+        model.eval()
+        print("✅ Model loaded successfully!")
+        print(f"Model has {sum(p.numel() for p in model.parameters())} parameters")
+        return model
+    except Exception as e:
+        print(f"❌ Error loading model: {str(e)}")
+        return None
+
+def generate_predictions(model, test_loader, use_tta=False):
+    """
+    Generate predictions on test set
+    Args:
+        model: Trained model
+        test_loader: Test data loader
+        use_tta: Whether to use Test Time Augmentation
+    """
+    model.eval()
+    predictions = []
+    image_names = []
+    probabilities = []
+    
+    print("Generating predictions...")
+    print(f"Test Time Augmentation: {'Enabled' if use_tta else 'Disabled'}")
+    
+    with torch.no_grad():
+        for batch_idx, (data, names) in enumerate(tqdm(test_loader, desc="Predicting")):
+            data = data.to(device)
+            
+            if use_tta:
+                # Test Time Augmentation - apply multiple transformations and average
+                tta_predictions = []
+                
+                # Original
+                outputs = model(data)
+                tta_predictions.append(torch.softmax(outputs, dim=1))
+                
+                # Horizontal flip
+                outputs = model(torch.flip(data, dims=[3]))
+                tta_predictions.append(torch.softmax(outputs, dim=1))
+                
+                # Vertical flip
+                outputs = model(torch.flip(data, dims=[2]))
+                tta_predictions.append(torch.softmax(outputs, dim=1))
+                
+                # Average all predictions
+                avg_probs = torch.mean(torch.stack(tta_predictions), dim=0)
+                preds = avg_probs.argmax(dim=1)
+                probs = avg_probs
+                
+            else:
+                # Standard inference
+                outputs = model(data)
+                probs = torch.softmax(outputs, dim=1)
+                preds = probs.argmax(dim=1)
+            
+            predictions.extend(preds.cpu().numpy())
+            probabilities.extend(probs.cpu().numpy())
+            image_names.extend(names)
+            
+            # Print progress every 50 batches
+            if (batch_idx + 1) % 50 == 0:
+                print(f"Processed {(batch_idx + 1) * test_loader.batch_size} images...")
+    
+    return predictions, probabilities, image_names
+
+def create_submission_file(predictions, image_names, filename="submission.csv"):
+    """
+    Create submission CSV file
+    """
+    print(f"\nCreating submission file: {filename}")
+    
+    submission_df = pd.DataFrame({
+        'id_code': image_names,
+        'diagnosis': predictions
+    })
+    
+    # Display prediction distribution
+    print("\nPrediction distribution:")
+    pred_counts = pd.Series(predictions).value_counts().sort_index()
+    for class_idx, count in pred_counts.items():
+        percentage = (count / len(predictions)) * 100
+        print(f"  Class {class_idx}: {count} images ({percentage:.1f}%)")
+    
+    # Save submission file
+    submission_df.to_csv(filename, index=False)
+    print(f"✅ Submission file saved: {filename}")
+    print(f"Total predictions: {len(predictions)}")
+    
+    return submission_df
+
+def save_detailed_results(predictions, probabilities, image_names, filename="detailed_predictions.csv"):
+    """
+    Save detailed predictions with probabilities
+    """
+    print(f"\nSaving detailed predictions: {filename}")
+    
+    # Create detailed dataframe
+    detailed_df = pd.DataFrame({
+        'id_code': image_names,
+        'predicted_class': predictions,
+        'prob_class_0': [prob[0] for prob in probabilities],
+        'prob_class_1': [prob[1] for prob in probabilities],
+        'prob_class_2': [prob[2] for prob in probabilities],
+        'prob_class_3': [prob[3] for prob in probabilities],
+        'prob_class_4': [prob[4] for prob in probabilities],
+        'max_probability': [max(prob) for prob in probabilities]
+    })
+    
+    detailed_df.to_csv(filename, index=False)
+    print(f"✅ Detailed predictions saved: {filename}")
+
+def main():
+    """
+    Main inference function
+    """
+    # Configuration
+    config = {
+        'model_path': '/kaggle/input/diabetic-retinopathy-vs-channel-model/best_vs_model.pth',  # Path to your trained model
+        'test_csv': '/kaggle/input/aptos2019-blindness-detection/test.csv',
+        'test_img_dir': '/kaggle/input/aptos2019-blindness-detection/test_images',
+        'batch_size': 32,  # Larger batch size for inference
+        'num_classes': 5,
+        'dropout_rate': 0.5,
+        'use_tta': True,  # Set to True for Test Time Augmentation
+        'submission_filename': 'submission.csv'
+    }
+    
+    print("="*70)
+    print("DIABETIC RETINOPATHY VS MODEL - INFERENCE")
+    print("="*70)
+    
+    # Check if model file exists
+    if not os.path.exists(config['model_path']):
+        print(f"❌ Model file not found: {config['model_path']}")
+        print("Please make sure you have the trained model file in the current directory.")
+        return
+    
+    # Load model
+    model = load_model(
+        config['model_path'], 
+        config['num_classes'], 
+        config['dropout_rate']
+    )
+    
+    if model is None:
+        return
+    
+    # Get test transforms
+    test_transforms = get_vs_test_transforms()
+    
+    # Load test dataset
+    test_dataset = DiabeticRetinopathyVSChannelDataset(
+        csv_file=config['test_csv'],
+        img_dir=config['test_img_dir'],
+        transform=test_transforms,
+        is_test=True
+    )
+    
+    # Create test data loader
+    test_loader = DataLoader(
+        test_dataset, 
+        batch_size=config['batch_size'], 
+        shuffle=False,
+        num_workers=4, 
+        pin_memory=True
+    )
+    
+    print(f"Test dataset size: {len(test_dataset)}")
+    print(f"Number of batches: {len(test_loader)}")
+    
+    # Generate predictions
+    predictions, probabilities, image_names = generate_predictions(
+        model, test_loader, use_tta=config['use_tta']
+    )
+    
+    # Create submission file
+    submission_df = create_submission_file(
+        predictions, image_names, config['submission_filename']
+    )
+    
+    # Save detailed results
+    save_detailed_results(predictions, probabilities, image_names)
+    
+    print(f"\n{'='*70}")
+    print("INFERENCE COMPLETED SUCCESSFULLY!")
+    print(f"{'='*70}")
+    print(f"✅ Submission file: {config['submission_filename']}")
+    print(f"✅ Detailed predictions: detailed_predictions.csv")
+    print(f"✅ Total images processed: {len(predictions)}")
+    print(f"✅ Test Time Augmentation: {'Used' if config['use_tta'] else 'Not used'}")
+    
+    return submission_df, predictions, probabilities
+
+# Additional utility functions
+
+def verify_submission_format(submission_file):
+    """
+    Verify the submission file format
+    """
+    try:
+        df = pd.read_csv(submission_file)
+        print(f"\n📋 Submission file verification:")
+        print(f"   File: {submission_file}")
+        print(f"   Shape: {df.shape}")
+        print(f"   Columns: {list(df.columns)}")
+        
+        # Check required columns
+        required_cols = ['id_code', 'diagnosis']
+        missing_cols = [col for col in required_cols if col not in df.columns]
+        
+        if missing_cols:
+            print(f"   ❌ Missing columns: {missing_cols}")
+        else:
+            print(f"   ✅ All required columns present")
+        
+        # Check diagnosis values
+        unique_diagnoses = sorted(df['diagnosis'].unique())
+        print(f"   Unique diagnosis values: {unique_diagnoses}")
+        
+        # Check for missing values
+        if df.isnull().sum().sum() > 0:
+            print(f"   ❌ Contains missing values:")
+            print(df.isnull().sum())
+        else:
+            print(f"   ✅ No missing values")
+            
+        return True
+        
+    except Exception as e:
+        print(f"❌ Error verifying submission file: {str(e)}")
+        return False
+
+# Run inference
+if __name__ == "__main__":
+    # Run main inference
+    try:
+        submission_df, predictions, probabilities = main()
+        
+        # Verify submission format
+        verify_submission_format('submission.csv')
+        
+        print("\n🎉 VS Model Inference Completed Successfully!")
+        
+    except Exception as e:
+        print(f"❌ Error during inference: {str(e)}")
+        import traceback
+        traceback.print_exc() 
