@@ -1,0 +1,395 @@
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader
+import torchvision.transforms as transforms
+import pandas as pd
+import numpy as np
+import cv2
+from PIL import Image
+import os
+from sklearn.metrics import cohen_kappa_score
+from tqdm import tqdm
+import timm
+import random
+
+# Set device
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+print(f"Using device: {device}")
+
+def crop_black_background(image, threshold=10):
+    """Crop black background from retinal images"""
+    if len(image.shape) == 3:
+        gray = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
+    else:
+        gray = image
+    
+    mask = gray > threshold
+    coords = np.argwhere(mask)
+    
+    if len(coords) == 0:
+        return image
+    
+    y0, x0 = coords.min(axis=0)
+    y1, x1 = coords.max(axis=0) + 1
+    return image[y0:y1, x0:x1]
+
+class DiabeticRetinopathyRGBHSVDataset(Dataset):
+    def __init__(self, csv_file, img_dir, transform=None, is_test=False, image_size=224):
+        self.data = pd.read_csv(csv_file)
+        self.img_dir = img_dir
+        self.transform = transform
+        self.is_test = is_test
+        self.image_size = image_size
+        
+        if not is_test:
+            print(f"Dataset loaded: {len(self.data)} images")
+            label_counts = self.data.iloc[:, 1].value_counts().sort_index()
+            print("Label distribution:")
+            for label, count in label_counts.items():
+                print(f"  Class {label}: {count} images ({count/len(self.data)*100:.1f}%)")
+        
+    def __len__(self):
+        return len(self.data)
+    
+    def preprocess_image(self, image_path):
+        image = cv2.imread(image_path)
+        if image is None:
+            raise ValueError(f"Could not load image: {image_path}")
+        
+        image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        image = crop_black_background(image, threshold=10)
+        image = cv2.resize(image, (self.image_size, self.image_size))
+        return image
+    
+    def __getitem__(self, idx):
+        img_name = self.data.iloc[idx, 0]
+        img_extensions = ['.jpeg', '.jpg', '.png']
+        img_path = None
+        
+        for ext in img_extensions:
+            potential_path = os.path.join(self.img_dir, f"{img_name}{ext}")
+            if os.path.exists(potential_path):
+                img_path = potential_path
+                break
+                
+        if img_path is None:
+            raise FileNotFoundError(f"Image {img_name} not found")
+        
+        # Load and preprocess RGB image
+        rgb_image = self.preprocess_image(img_path)
+        
+        # Convert to HSV
+        hsv_image = cv2.cvtColor(rgb_image, cv2.COLOR_RGB2HSV)
+        
+        # Convert to PIL for transforms
+        rgb_pil = Image.fromarray(rgb_image)
+        hsv_pil = Image.fromarray(hsv_image)
+        
+        if self.transform:
+            rgb_tensor = self.transform(rgb_pil)
+            hsv_tensor = self.transform(hsv_pil)
+        else:
+            # Default transforms if none provided
+            transform = transforms.Compose([
+                transforms.ToTensor(),
+            ])
+            rgb_tensor = transform(rgb_pil)
+            hsv_tensor = transform(hsv_pil)
+        
+        # Apply proper normalization
+        rgb_normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+        hsv_normalize = transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
+        
+        rgb_tensor = rgb_normalize(rgb_tensor)
+        hsv_tensor = hsv_normalize(hsv_tensor)
+        
+        if not self.is_test:
+            label = int(self.data.iloc[idx, 1])
+            return (rgb_tensor, hsv_tensor), label
+        else:
+            return (rgb_tensor, hsv_tensor), img_name
+
+class DualStreamSwinFusion(nn.Module):
+    def __init__(self, num_classes=5, dropout_rate=0.3, model_name='swin_base_patch4_window7_224'):
+        super(DualStreamSwinFusion, self).__init__()
+        
+        # RGB stream
+        self.rgb_backbone = timm.create_model(model_name, pretrained=True, num_classes=0)
+        self.rgb_features = self.rgb_backbone.num_features
+        print(f"RGB backbone features: {self.rgb_features}")
+        
+        # HSV stream (separate backbone)
+        self.hsv_backbone = timm.create_model(model_name, pretrained=True, num_classes=0)
+        self.hsv_features = self.hsv_backbone.num_features
+        print(f"HSV backbone features: {self.hsv_features}")
+        
+        # Total features after fusion
+        self.total_features = self.rgb_features + self.hsv_features
+        print(f"Total features after fusion: {self.total_features}")
+        
+        # Feature fusion with attention
+        self.attention = nn.Sequential(
+            nn.Linear(self.total_features, 512),
+            nn.ReLU(),
+            nn.Linear(512, 2),
+            nn.Softmax(dim=1)
+        )
+        
+        # Classifier - FIXED: Use the correct dimension
+        self.classifier = nn.Sequential(
+            nn.LayerNorm(self.rgb_features),  # FIXED: Use single stream dimension
+            nn.Dropout(dropout_rate),
+            nn.Linear(self.rgb_features, 512),  # FIXED: Use single stream dimension
+            nn.GELU(),
+            nn.Dropout(dropout_rate/2),
+            nn.Linear(512, num_classes)
+        )
+        
+    def forward(self, x):
+        rgb, hsv = x
+        
+        rgb_features = self.rgb_backbone(rgb)
+        hsv_features = self.hsv_backbone(hsv)
+        
+        # Concatenate features for attention
+        combined = torch.cat([rgb_features, hsv_features], dim=1)
+        
+        # Attention-based fusion
+        attention_weights = self.attention(combined)
+        rgb_weight, hsv_weight = attention_weights[:, 0:1], attention_weights[:, 1:2]
+        
+        # Apply attention weights and sum
+        weighted_features = (rgb_weight * rgb_features) + (hsv_weight * hsv_features)
+        
+        return self.classifier(weighted_features)
+
+def get_dual_stream_transforms():
+    train_transforms = transforms.Compose([
+        transforms.Resize((224, 224)),
+        transforms.RandomHorizontalFlip(p=0.5),
+        transforms.RandomVerticalFlip(p=0.5),
+        transforms.RandomRotation(degrees=15),
+        transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.1),
+        transforms.RandomResizedCrop(224, scale=(0.8, 1.0)),
+        transforms.ToTensor(),
+    ])
+    
+    val_transforms = transforms.Compose([
+        transforms.Resize((224, 224)),
+        transforms.ToTensor(),
+    ])
+    
+    return train_transforms, val_transforms
+
+def quadratic_weighted_kappa(y_true, y_pred):
+    return cohen_kappa_score(y_true, y_pred, weights='quadratic')
+
+def train_dual_stream_model(model, train_loader, val_loader, num_epochs=60, learning_rate=2e-5):
+    criterion = nn.CrossEntropyLoss()
+    
+    # Separate learning rates for different components
+    rgb_params = list(model.rgb_backbone.parameters())
+    hsv_params = list(model.hsv_backbone.parameters())
+    fusion_params = list(model.attention.parameters()) + list(model.classifier.parameters())
+    
+    optimizer = optim.AdamW([
+        {'params': rgb_params, 'lr': learning_rate * 0.1},
+        {'params': hsv_params, 'lr': learning_rate * 0.1},
+        {'params': fusion_params, 'lr': learning_rate}
+    ], weight_decay=1e-4)
+    
+    scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=10, T_mult=2, eta_min=1e-6)
+    
+    best_kappa = 0.0
+    best_model_state = None
+    history = {'train_losses': [], 'val_losses': [], 'val_kappas': [], 'val_accuracies': []}
+    
+    for epoch in range(num_epochs):
+        # Training
+        model.train()
+        train_loss = 0.0
+        train_correct = 0
+        train_total = 0
+        
+        train_pbar = tqdm(train_loader, desc=f'Epoch {epoch+1}/{num_epochs} [Train]')
+        for data, target in train_pbar:
+            rgb, hsv = data
+            rgb, hsv, target = rgb.to(device), hsv.to(device), target.to(device)
+            
+            optimizer.zero_grad()
+            output = model((rgb, hsv))
+            loss = criterion(output, target)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            optimizer.step()
+            
+            train_loss += loss.item()
+            pred = output.argmax(dim=1, keepdim=True)
+            train_correct += pred.eq(target.view_as(pred)).sum().item()
+            train_total += target.size(0)
+            
+            current_acc = 100. * train_correct / train_total
+            train_pbar.set_postfix({
+                'Loss': f'{loss.item():.4f}',
+                'Acc': f'{current_acc:.2f}%'
+            })
+        
+        # Validation
+        model.eval()
+        val_loss = 0.0
+        val_correct = 0
+        val_total = 0
+        all_preds, all_targets = [], []
+        
+        with torch.no_grad():
+            val_pbar = tqdm(val_loader, desc=f'Epoch {epoch+1}/{num_epochs} [Val]')
+            for data, target in val_pbar:
+                rgb, hsv = data
+                rgb, hsv, target = rgb.to(device), hsv.to(device), target.to(device)
+                
+                output = model((rgb, hsv))
+                loss = criterion(output, target)
+                val_loss += loss.item()
+                
+                pred = output.argmax(dim=1, keepdim=True)
+                val_correct += pred.eq(target.view_as(pred)).sum().item()
+                val_total += target.size(0)
+                
+                all_preds.extend(pred.cpu().numpy().flatten())
+                all_targets.extend(target.cpu().numpy())
+                
+                current_acc = 100. * val_correct / val_total
+                val_pbar.set_postfix({
+                    'Loss': f'{loss.item():.4f}',
+                    'Acc': f'{current_acc:.2f}%'
+                })
+        
+        # Calculate metrics
+        avg_train_loss = train_loss / len(train_loader)
+        avg_val_loss = val_loss / len(val_loader)
+        val_accuracy = 100. * val_correct / val_total
+        val_kappa = quadratic_weighted_kappa(all_targets, all_preds)
+        
+        history['train_losses'].append(avg_train_loss)
+        history['val_losses'].append(avg_val_loss)
+        history['val_kappas'].append(val_kappa)
+        history['val_accuracies'].append(val_accuracy)
+        
+        scheduler.step()
+        current_lr = optimizer.param_groups[0]['lr']
+        
+        print(f'\nEpoch {epoch+1}/{num_epochs}:')
+        print(f'  Train Loss: {avg_train_loss:.4f} | Train Acc: {100. * train_correct / train_total:.2f}%')
+        print(f'  Val Loss: {avg_val_loss:.4f} | Val Acc: {val_accuracy:.2f}%')
+        print(f'  Val QWK: {val_kappa:.4f}')
+        print(f'  Learning Rate: {current_lr:.8f}')
+        
+        if val_kappa > best_kappa:
+            best_kappa = val_kappa
+            best_model_state = model.state_dict().copy()
+            torch.save(best_model_state, 'best_dual_stream_model.pth')
+            print(f'  ✅ New best model saved! QWK: {best_kappa:.4f}')
+        
+        print('-' * 70)
+    
+    # Load best model
+    if best_model_state is not None:
+        model.load_state_dict(best_model_state)
+    
+    history['best_kappa'] = best_kappa
+    history['total_epochs'] = epoch + 1
+    
+    return model, history
+
+def main():
+    config = {
+        'train_csv': '/kaggle/input/aptos2019-blindness-detection/train.csv',
+        'train_img_dir': '/kaggle/input/aptos2019-blindness-detection/train_images',
+        'batch_size': 8,
+        'num_epochs': 60,
+        'learning_rate': 2e-5,
+        'image_size': 224,
+        'model_name': 'swin_base_patch4_window7_224'
+    }
+    
+    print("="*70)
+    print("DUAL-STREAM SWIN TRANSFORMER RGB+HSV FUSION MODEL")
+    print("="*70)
+    
+    # Get transforms
+    train_transforms, val_transforms = get_dual_stream_transforms()
+    
+    # Load dataset
+    print("\nLoading dual-stream RGB+HSV training data...")
+    full_dataset = DiabeticRetinopathyRGBHSVDataset(
+        csv_file=config['train_csv'],
+        img_dir=config['train_img_dir'],
+        transform=train_transforms,
+        image_size=config['image_size']
+    )
+    
+    # Split dataset
+    train_size = int(0.8 * len(full_dataset))
+    val_size = len(full_dataset) - train_size
+    train_dataset, val_dataset = torch.utils.data.random_split(
+        full_dataset, [train_size, val_size],
+        generator=torch.Generator().manual_seed(42)
+    )
+    
+    # Create loaders
+    train_loader = DataLoader(
+        train_dataset, 
+        batch_size=config['batch_size'], 
+        shuffle=True,
+        num_workers=2,
+        pin_memory=True
+    )
+    val_loader = DataLoader(
+        val_dataset, 
+        batch_size=config['batch_size'], 
+        shuffle=False,
+        num_workers=2,
+        pin_memory=True
+    )
+    
+    # Initialize model
+    print(f"\nInitializing dual-stream {config['model_name']} RGB+HSV fusion model...")
+    model = DualStreamSwinFusion(
+        num_classes=5,
+        dropout_rate=0.3,
+        model_name=config['model_name']
+    )
+    model.to(device)
+    
+    # Print model information
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"Total parameters: {total_params:,}")
+    print(f"Trainable parameters: {trainable_params:,}")
+    
+    # Train
+    print(f"\nStarting dual-stream {config['model_name']} RGB+HSV fusion model training...")
+    model, history = train_dual_stream_model(
+        model, train_loader, val_loader,
+        num_epochs=config['num_epochs'],
+        learning_rate=config['learning_rate']
+    )
+    
+    print(f"\nTraining completed!")
+    print(f"Best QWK: {history['best_kappa']:.4f}")
+    print(f"Total epochs: {history['total_epochs']}")
+    
+    return model, history
+
+if __name__ == "__main__":
+    # Set random seeds for reproducibility
+    torch.manual_seed(42)
+    np.random.seed(42)
+    random.seed(42)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+    
+    # Run dual-stream RGB+HSV fusion experiment
+    model, history = main()
+
