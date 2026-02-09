@@ -1,0 +1,475 @@
+import torch
+import torch.nn as nn
+from torch.utils.data import Dataset, DataLoader
+import torchvision.transforms as transforms
+from torchvision import models
+import pandas as pd
+import numpy as np
+import cv2
+from PIL import Image
+import os
+from tqdm import tqdm
+import warnings
+import json
+warnings.filterwarnings('ignore')
+
+# Set device
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+print(f"Using device: {device}")
+
+class DiabeticRetinopathyGBDataset(Dataset):
+    """
+    Custom Dataset for Diabetic Retinopathy with GB (Green-Blue) channels (Test Dataset)
+    """
+    def __init__(self, csv_file, img_dir, transform=None):
+        """
+        Args:
+            csv_file (string): Path to csv with image names
+            img_dir (string): Directory with all images
+            transform (callable, optional): Transform to be applied on images
+        """
+        self.data = pd.read_csv(csv_file)
+        self.img_dir = img_dir
+        self.transform = transform
+        
+        print(f"GB Test dataset loaded: {len(self.data)} images")
+        
+    def __len__(self):
+        return len(self.data)
+    
+    def __getitem__(self, idx):
+        if torch.is_tensor(idx):
+            idx = idx.tolist()
+            
+        # Get image name (handle both string and numeric names)
+        img_name = str(self.data.iloc[idx, 0])
+        
+        # Try different extensions
+        img_path = None
+        for ext in ['.jpeg', '.jpg', '.png']:
+            potential_path = os.path.join(self.img_dir, f"{img_name}{ext}")
+            if os.path.exists(potential_path):
+                img_path = potential_path
+                break
+                
+        if img_path is None:
+            raise FileNotFoundError(f"Image {img_name} not found with any extension")
+        
+        try:
+            # Load image
+            image = cv2.imread(img_path)
+            if image is None:
+                raise ValueError(f"Could not load image: {img_path}")
+            
+            # Convert BGR to RGB
+            image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+            
+            # Extract Green and Blue channels only
+            image_gb = np.zeros((image_rgb.shape[0], image_rgb.shape[1], 2), dtype=np.uint8)
+            image_gb[:, :, 0] = image_rgb[:, :, 1]  # Green channel
+            image_gb[:, :, 1] = image_rgb[:, :, 2]  # Blue channel
+            
+            # Convert to tensor format directly
+            image_tensor = torch.from_numpy(image_gb).permute(2, 0, 1).float() / 255.0
+            
+            if self.transform:
+                # Apply transforms that work with tensors
+                image_tensor = self.transform(image_tensor)
+                
+        except Exception as e:
+            print(f"Error loading image {img_name}: {e}")
+            # Return a dummy tensor in case of error
+            image_tensor = torch.zeros((2, 512, 512), dtype=torch.float32)
+            
+        return image_tensor, img_name
+
+class GBTransforms:
+    """
+    Custom transforms for GB (2-channel) test images
+    """
+    def __init__(self, size=(512, 512), mean=None, std=None):
+        self.size = size
+        self.mean = mean or [0.5, 0.5]
+        self.std = std or [0.5, 0.5]
+        
+    def __call__(self, tensor):
+        # tensor shape: (2, H, W)
+        
+        # Resize
+        tensor = torch.nn.functional.interpolate(
+            tensor.unsqueeze(0), 
+            size=self.size, 
+            mode='bilinear', 
+            align_corners=False
+        ).squeeze(0)
+        
+        # Normalize - CRITICAL: Apply channel-specific normalization
+        for i in range(2):
+            tensor[i] = (tensor[i] - self.mean[i]) / self.std[i]
+            
+        return tensor
+
+class DREfficientNetB2GBClassifier(nn.Module):
+    """
+    Diabetic Retinopathy Classifier using EfficientNet-B2 for GB (Green-Blue) channels
+    """
+    def __init__(self, num_classes=5, pretrained=False, dropout_rate=0.4):
+        super(DREfficientNetB2GBClassifier, self).__init__()
+        
+        # Use EfficientNet-B2 as backbone
+        self.backbone = models.efficientnet_b2(pretrained=pretrained)
+        
+        # Store original first conv layer for weight adaptation
+        original_conv = self.backbone.features[0][0]
+        
+        # Modify first conv layer for 2 input channels (GB)
+        self.backbone.features[0][0] = nn.Conv2d(
+            2, original_conv.out_channels, 
+            kernel_size=original_conv.kernel_size,
+            stride=original_conv.stride,
+            padding=original_conv.padding,
+            bias=original_conv.bias is not None
+        )
+        
+        # Initialize new conv1 weights (no pretrained weights needed for inference)
+        if pretrained:
+            with torch.no_grad():
+                # Use Green and Blue weights from pretrained model
+                # Green channel (index 1 in RGB) -> GB channel 0
+                self.backbone.features[0][0].weight[:, 0:1, :, :] = original_conv.weight[:, 1:2, :, :]
+                # Blue channel (index 2 in RGB) -> GB channel 1  
+                self.backbone.features[0][0].weight[:, 1:2, :, :] = original_conv.weight[:, 2:3, :, :]
+                
+                # Copy bias if exists
+                if original_conv.bias is not None:
+                    self.backbone.features[0][0].bias = nn.Parameter(original_conv.bias.clone())
+        
+        # Get the number of features in the classifier
+        num_features = self.backbone.classifier[1].in_features
+        
+        # Replace final layer with custom classifier
+        self.backbone.classifier = nn.Sequential(
+            nn.Dropout(p=dropout_rate),
+            nn.Linear(num_features, 512),
+            nn.ReLU(),
+            nn.Dropout(p=dropout_rate/2),
+            nn.Linear(512, num_classes)
+        )
+        
+    def forward(self, x):
+        return self.backbone(x)
+
+def get_gb_test_transforms(gb_mean, gb_std):
+    """
+    Define preprocessing transforms for GB test images (no augmentation)
+    """
+    return GBTransforms(
+        size=(512, 512), 
+        mean=gb_mean, 
+        std=gb_std
+    )
+
+def safe_load_model(model_path, device):
+    """
+    Safely load model with proper error handling for PyTorch 2.6+
+    """
+    try:
+        # First try with weights_only=True (safer)
+        checkpoint = torch.load(model_path, map_location=device, weights_only=True)
+        print("Model loaded with weights_only=True (safe mode)")
+        return checkpoint
+    except Exception as e:
+        print(f"weights_only=True failed: {e}")
+        print("Trying with weights_only=False (requires trust in the model source)")
+        try:
+            # If that fails, try with weights_only=False (less safe but compatible)
+            checkpoint = torch.load(model_path, map_location=device, weights_only=False)
+            print("Model loaded with weights_only=False")
+            return checkpoint
+        except Exception as e2:
+            print(f"weights_only=False also failed: {e2}")
+            raise
+
+def load_trained_gb_model(model_path, num_classes=5, dropout_rate=0.4):
+    """
+    Load the pre-trained GB EfficientNet-B2 model
+    """
+    print(f"Loading GB EfficientNet-B2 model from: {model_path}")
+    
+    # Initialize model architecture WITHOUT downloading pretrained weights
+    model = DREfficientNetB2GBClassifier(
+        num_classes=num_classes, 
+        dropout_rate=dropout_rate, 
+        pretrained=False
+    )
+    
+    # Load trained weights with safe loading
+    checkpoint = safe_load_model(model_path, device)
+    
+    # Handle different checkpoint formats
+    if isinstance(checkpoint, dict):
+        if 'model_state_dict' in checkpoint:
+            model.load_state_dict(checkpoint['model_state_dict'])
+            print(f"Loaded model from epoch {checkpoint.get('epoch', 'unknown')}")
+            print(f"Best QWK: {checkpoint.get('best_kappa', 'unknown')}")
+        elif 'state_dict' in checkpoint:
+            model.load_state_dict(checkpoint['state_dict'])
+            print("Loaded model from state_dict")
+        else:
+            # Assume it's the full state dict
+            model.load_state_dict(checkpoint)
+            print("Loaded model from state dict")
+    else:
+        model.load_state_dict(checkpoint)
+        print("Loaded model from checkpoint")
+    
+    model.to(device)
+    model.eval()
+    
+    print("GB EfficientNet-B2 model loaded successfully!")
+    
+    # Print model info
+    total_params = sum(p.numel() for p in model.parameters())
+    print(f"Model parameters: {total_params:,}")
+    
+    return model
+
+def generate_gb_predictions(model, test_loader, use_tta=False):
+    """
+    Generate predictions for test set using GB model
+    
+    Args:
+        model: Trained GB model
+        test_loader: DataLoader for test set
+        use_tta: Whether to use Test Time Augmentation (TTA)
+    """
+    model.eval()
+    predictions = []
+    image_names = []
+    all_probabilities = []
+    
+    print("Generating GB predictions...")
+    
+    with torch.no_grad():
+        for data, names in tqdm(test_loader, desc="Processing GB test images"):
+            data = data.to(device)
+            
+            if use_tta:
+                # Test Time Augmentation for GB model
+                outputs = model(data)
+                
+                # Horizontal flip
+                data_hflip = torch.flip(data, dims=[3])
+                outputs += model(data_hflip)
+                
+                # Vertical flip
+                data_vflip = torch.flip(data, dims=[2])
+                outputs += model(data_vflip)
+                
+                # Average the predictions
+                outputs = outputs / 3.0
+            else:
+                outputs = model(data)
+            
+            # Convert logits to probabilities
+            probs = torch.softmax(outputs, dim=1)
+            
+            # Get predicted classes
+            preds = probs.argmax(dim=1)
+            
+            predictions.extend(preds.cpu().numpy())
+            image_names.extend(names)
+            all_probabilities.extend(probs.cpu().numpy())
+    
+    return predictions, image_names, np.array(all_probabilities)
+
+def create_submission_file(predictions, image_names, output_file='gb_effnet_submission.csv'):
+    """
+    Create submission file in Kaggle format
+    """
+    submission_df = pd.DataFrame({
+        'id_code': image_names,
+        'diagnosis': predictions
+    })
+    
+    # Sort by id_code to ensure consistent ordering
+    submission_df = submission_df.sort_values('id_code')
+    
+    # Save to CSV
+    submission_df.to_csv(output_file, index=False)
+    
+    print(f"GB Submission file saved: {output_file}")
+    print(f"Total predictions: {len(submission_df)}")
+    
+    # Print prediction distribution
+    print("\nGB Model Prediction distribution:")
+    label_names = ['No DR', 'Mild', 'Moderate', 'Severe', 'Proliferative']
+    for i, label in enumerate(label_names):
+        count = (submission_df['diagnosis'] == i).sum()
+        percentage = count / len(submission_df) * 100
+        print(f"  Class {i} ({label}): {count} images ({percentage:.1f}%)")
+    
+    return submission_df
+
+def save_probability_analysis(predictions, probabilities, image_names, output_file='gb_effnet_probabilities.csv'):
+    """
+    Save probability analysis for debugging and analysis
+    """
+    prob_df = pd.DataFrame(probabilities, columns=[f'class_{i}_prob' for i in range(5)])
+    prob_df['id_code'] = image_names
+    prob_df['prediction'] = predictions
+    
+    # Calculate confidence scores (max probability)
+    prob_df['confidence'] = np.max(probabilities, axis=1)
+    
+    # Reorder columns
+    cols = ['id_code', 'prediction', 'confidence'] + [f'class_{i}_prob' for i in range(5)]
+    prob_df = prob_df[cols]
+    
+    prob_df.to_csv(output_file, index=False)
+    print(f"GB Probability analysis saved: {output_file}")
+    
+    return prob_df
+
+def load_normalization_stats(stats_file='gb_effnet_normalization_stats.json'):
+    """
+    Load GB normalization statistics from file
+    """
+    try:
+        with open(stats_file, 'r') as f:
+            stats = json.load(f)
+        gb_mean = stats.get('gb_mean', [0.5, 0.5])
+        gb_std = stats.get('gb_std', [0.5, 0.5])
+        print(f"Loaded GB normalization stats: mean={gb_mean}, std={gb_std}")
+        return gb_mean, gb_std
+    except FileNotFoundError:
+        print(f"Warning: Normalization stats file '{stats_file}' not found.")
+        print("Using default GB normalization: mean=[0.5, 0.5], std=[0.5, 0.5]")
+        return [0.5, 0.5], [0.5, 0.5]
+    except Exception as e:
+        print(f"Error loading normalization stats: {e}")
+        return [0.5, 0.5], [0.5, 0.5]
+
+def main():
+    """
+    Main inference pipeline for GB EfficientNet-B2 model
+    """
+    # Configuration
+    config = {
+        'model_path': '/kaggle/input/gb-efficientnetb2-training/best_gb_effnet_model.pth',  # Update with your GB model path
+        'normalization_stats': '/kaggle/input/gb-efficientnetb2-training/gb_effnet_normalization_stats.json',  # From training
+        'test_csv': '/kaggle/input/aptos2019-blindness-detection/test.csv',
+        'test_img_dir': '/kaggle/input/aptos2019-blindness-detection/test_images',
+        'batch_size': 32,
+        'num_classes': 5,
+        'dropout_rate': 0.4,
+        'use_tta': True,
+        'output_file': 'submission.csv',
+        'save_probabilities': True
+    }
+    
+    print("="*70)
+    print("DIABETIC RETINOPATHY GB EFFICIENTNET-B2 MODEL - INFERENCE")
+    print("="*70)
+    print("Configuration:")
+    print(f"  Model: GB EfficientNet-B2 (2-channel Green-Blue)")
+    print(f"  Input channels: 2 (Green + Blue from RGB)")
+    print(f"  Image size: 512x512")
+    print(f"  TTA: {config['use_tta']}")
+    for key, value in config.items():
+        if key not in ['model_path', 'test_csv', 'test_img_dir', 'normalization_stats']:
+            print(f"  {key}: {value}")
+    print("="*70)
+    
+    # Check if test files exist
+    if not os.path.exists(config['test_csv']):
+        print(f"Error: Test CSV file not found at {config['test_csv']}")
+        return
+    
+    if not os.path.exists(config['test_img_dir']):
+        print(f"Error: Test images directory not found at {config['test_img_dir']}")
+        return
+    
+    if not os.path.exists(config['model_path']):
+        print(f"Error: GB Model file not found at {config['model_path']}")
+        print("Please make sure the model file exists or update the model_path in the config.")
+        print("Expected file: best_gb_effnet_model.pth")
+        return
+    
+    # Load GB normalization statistics
+    gb_mean, gb_std = load_normalization_stats(config['normalization_stats'])
+    
+    # Load trained GB model
+    model = load_trained_gb_model(
+        config['model_path'], 
+        config['num_classes'], 
+        config['dropout_rate']
+    )
+    
+    # Get GB test transforms with proper normalization
+    test_transforms = get_gb_test_transforms(gb_mean, gb_std)
+    
+    # Load test dataset with GB preprocessing
+    print("\nLoading GB test data...")
+    test_dataset = DiabeticRetinopathyGBDataset(
+        csv_file=config['test_csv'],
+        img_dir=config['test_img_dir'],
+        transform=test_transforms
+    )
+    
+    # Create test data loader
+    test_loader = DataLoader(
+        test_dataset, 
+        batch_size=config['batch_size'], 
+        shuffle=False, 
+        num_workers=4,
+        pin_memory=True
+    )
+    
+    # Generate predictions
+    print(f"\nGenerating GB predictions with TTA: {config['use_tta']}")
+    predictions, image_names, probabilities = generate_gb_predictions(
+        model, 
+        test_loader, 
+        use_tta=config['use_tta']
+    )
+    
+    # Create submission file
+    print("\nCreating GB submission file...")
+    submission_df = create_submission_file(
+        predictions, 
+        image_names, 
+        config['output_file']
+    )
+    
+    # Save probability analysis if requested
+    if config['save_probabilities']:
+        print("\nSaving probability analysis...")
+        prob_df = save_probability_analysis(
+            predictions, 
+            probabilities, 
+            image_names,
+            'gb_effnet_probabilities.csv'
+        )
+    
+    print("\n" + "="*70)
+    print("GB EFFICIENTNET-B2 INFERENCE COMPLETED SUCCESSFULLY!")
+    print("="*70)
+    print(f"Submission file: {config['output_file']}")
+    print(f"Total test images processed: {len(predictions)}")
+    print(f"Input type: 2-channel GB (Green-Blue)")
+    print(f"Model: EfficientNet-B2 adapted for GB channels")
+    print(f"GB Normalization: mean={gb_mean}, std={gb_std}")
+    print("="*70)
+    
+    return submission_df
+
+if __name__ == "__main__":
+    # Set random seeds for reproducibility
+    torch.manual_seed(42)
+    np.random.seed(42)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+    
+    # Run inference
+    submission_df = main()
