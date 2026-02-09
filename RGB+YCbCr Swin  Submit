@@ -1,0 +1,436 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
+import torchvision.transforms as transforms
+import pandas as pd
+import numpy as np
+import cv2
+from PIL import Image
+import os
+from tqdm import tqdm
+import warnings
+import random
+from datetime import datetime
+warnings.filterwarnings('ignore')
+
+# Import Swin Transformer (assuming transformers is pre-installed)
+from transformers import SwinForImageClassification, SwinConfig
+
+# Set device
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+print(f"Using device: {device}")
+
+# Set random seeds for reproducibility
+torch.manual_seed(42)
+np.random.seed(42)
+random.seed(42)
+torch.backends.cudnn.deterministic = True
+torch.backends.cudnn.benchmark = False
+
+def crop_black_background(image, threshold=10):
+    """
+    Crop black background from retinal images
+    """
+    if len(image.shape) == 3:
+        gray = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
+    else:
+        gray = image
+    
+    mask = gray > threshold
+    coords = np.argwhere(mask)
+    if len(coords) == 0:
+        return image
+    
+    y0, x0 = coords.min(axis=0)
+    y1, x1 = coords.max(axis=0) + 1
+    cropped = image[y0:y1, x0:x1]
+    return cropped
+
+class SwinFeatureExtractor(nn.Module):
+    """
+    Swin Transformer feature extractor adapted for YCbCr images
+    """
+    def __init__(self, pretrained=False):
+        super(SwinFeatureExtractor, self).__init__()
+        
+        config = SwinConfig(
+            image_size=384,
+            patch_size=4,
+            num_channels=3,
+            embed_dim=96,
+            depths=[2, 2, 6, 2],
+            num_heads=[3, 6, 12, 24],
+            window_size=7,
+            mlp_ratio=4.0,
+            qkv_bias=True,
+            drop_rate=0.0,
+            attn_drop_rate=0.0,
+            drop_path_rate=0.1,
+            hidden_act="gelu",
+            use_absolute_embeddings=False,
+            patch_norm=True,
+            layer_norm_eps=1e-5,
+            num_labels=5
+        )
+        
+        self.swin = SwinForImageClassification(config)
+        self.num_features = self.swin.classifier.in_features
+        self.swin.classifier = nn.Identity()
+        
+    def forward(self, x):
+        outputs = self.swin(x)
+        return outputs.logits if hasattr(outputs, 'logits') else outputs
+
+class EnhancedSwinDualStreamFusion(nn.Module):
+    """
+    Enhanced fusion with Swin Transformer and attention mechanism
+    """
+    def __init__(self, num_classes=5, dropout_rate=0.5):
+        super(EnhancedSwinDualStreamFusion, self).__init__()
+        
+        self.rgb_backbone = SwinFeatureExtractor()
+        self.ycbcr_backbone = SwinFeatureExtractor()
+        
+        rgb_features = self.rgb_backbone.num_features
+        ycbcr_features = self.ycbcr_backbone.num_features
+        
+        self.attention = nn.Sequential(
+            nn.Linear(rgb_features + ycbcr_features, 512),
+            nn.ReLU(inplace=True),
+            nn.Linear(512, 2),
+            nn.Softmax(dim=1)
+        )
+        
+        self.classifier = nn.Sequential(
+            nn.Dropout(dropout_rate),
+            nn.Linear(rgb_features + ycbcr_features, 1024),
+            nn.ReLU(inplace=True),
+            nn.BatchNorm1d(1024),
+            nn.Dropout(dropout_rate/2),
+            nn.Linear(1024, 512),
+            nn.ReLU(inplace=True),
+            nn.BatchNorm1d(512),
+            nn.Dropout(dropout_rate/2),
+            nn.Linear(512, num_classes)
+        )
+        
+    def forward(self, x):
+        rgb, ycbcr = x
+        rgb_features = self.rgb_backbone(rgb)
+        ycbcr_features = self.ycbcr_backbone(ycbcr)
+        
+        combined = torch.cat([rgb_features, ycbcr_features], dim=1)
+        attention_weights = self.attention(combined)
+        
+        weighted_rgb = attention_weights[:, 0:1] * rgb_features
+        weighted_ycbcr = attention_weights[:, 1:2] * ycbcr_features
+        fused_features = torch.cat([weighted_rgb, weighted_ycbcr], dim=1)
+        
+        return self.classifier(fused_features)
+
+class TestDataset(Dataset):
+    """
+    Test Dataset for Diabetic Retinopathy with RGB + YCbCr fusion
+    """
+    def __init__(self, csv_file, img_dir, image_size=384):
+        self.data = pd.read_csv(csv_file)
+        self.img_dir = img_dir
+        self.image_size = image_size
+        print(f"Test dataset loaded: {len(self.data)} images")
+        
+    def __len__(self):
+        return len(self.data)
+    
+    def preprocess_image(self, image_path):
+        image = cv2.imread(image_path)
+        if image is None:
+            raise ValueError(f"Could not load image: {image_path}")
+        
+        image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        image = crop_black_background(image, threshold=10)
+        image = cv2.resize(image, (self.image_size, self.image_size))
+        return image
+    
+    def rgb_to_ycbcr_tensor(self, rgb_image):
+        ycbcr_image = cv2.cvtColor(rgb_image, cv2.COLOR_RGB2YCrCb)
+        return ycbcr_image
+    
+    def __getitem__(self, idx):
+        if torch.is_tensor(idx):
+            idx = idx.tolist()
+            
+        img_name = self.data.iloc[idx, 0]
+        img_extensions = ['.jpeg', '.jpg', '.png']
+        img_path = None
+        
+        for ext in img_extensions:
+            potential_path = os.path.join(self.img_dir, f"{img_name}{ext}")
+            if os.path.exists(potential_path):
+                img_path = potential_path
+                break
+                
+        if img_path is None:
+            raise FileNotFoundError(f"Image {img_name} not found with any extension")
+        
+        rgb_image = self.preprocess_image(img_path)
+        ycbcr_image = self.rgb_to_ycbcr_tensor(rgb_image)
+        
+        rgb_tensor = torch.from_numpy(rgb_image.transpose(2, 0, 1)).float() / 255.0
+        ycbcr_tensor = torch.from_numpy(ycbcr_image.transpose(2, 0, 1)).float() / 255.0
+        
+        rgb_tensor = transforms.Normalize(
+            mean=[0.485, 0.456, 0.406], 
+            std=[0.229, 0.224, 0.225]
+        )(rgb_tensor)
+        
+        ycbcr_tensor = transforms.Normalize(
+            mean=[0.485, 0.456, 0.406], 
+            std=[0.229, 0.224, 0.225]
+        )(ycbcr_tensor)
+        
+        return (rgb_tensor, ycbcr_tensor), img_name
+
+def apply_tta_transforms(images):
+    """
+    Apply test-time augmentations for better predictions
+    """
+    augmented = []
+    for img in images:
+        img = img.cpu().numpy().transpose(1, 2, 0)
+        
+        # Random horizontal flip
+        if random.random() < 0.5:
+            img = np.fliplr(img).copy()  # Add .copy() to ensure positive strides
+            
+        # Random vertical flip
+        if random.random() < 0.5:
+            img = np.flipud(img).copy()  # Add .copy() to ensure positive strides
+            
+        # Random rotation (0, 90, 180, 270 degrees)
+        if random.random() < 0.7:
+            k = random.randint(0, 3)
+            img = np.rot90(img, k).copy()  # Add .copy() to ensure positive strides
+            
+        # Random brightness adjustment
+        if random.random() < 0.3:
+            alpha = random.uniform(0.95, 1.05)
+            img = np.clip(img * alpha, 0, 1)
+            
+        img = torch.from_numpy(img.transpose(2, 0, 1)).float().to(device)
+        augmented.append(img)
+    
+    return torch.stack(augmented)
+
+def predict_with_tta(model, data_loader, num_tta=8):
+    """
+    Make predictions using Test-Time Augmentation
+    """
+    model.eval()
+    all_preds = []
+    all_probs = []
+    all_names = []
+    
+    print(f"Making predictions with {num_tta} TTA iterations...")
+    
+    with torch.no_grad():
+        for (rgb_data, ycbcr_data), img_names in tqdm(data_loader, desc='TTA Prediction'):
+            rgb_data = rgb_data.to(device)
+            ycbcr_data = ycbcr_data.to(device)
+            
+            output = model((rgb_data, ycbcr_data))
+            probs = F.softmax(output, dim=1)
+            total_probs = probs
+            
+            for _ in range(num_tta - 1):
+                augmented_rgb = apply_tta_transforms(rgb_data)
+                augmented_ycbcr = apply_tta_transforms(ycbcr_data)
+                output = model((augmented_rgb, augmented_ycbcr))
+                probs = F.softmax(output, dim=1)
+                total_probs += probs
+            
+            avg_probs = total_probs / num_tta
+            preds = avg_probs.argmax(dim=1)
+            
+            all_preds.extend(preds.cpu().numpy())
+            all_probs.extend(avg_probs.cpu().numpy())
+            all_names.extend(img_names)
+    
+    return np.array(all_preds), np.array(all_probs), all_names
+
+def make_simple_predictions(model, data_loader):
+    """
+    Make simple predictions without TTA
+    """
+    model.eval()
+    all_preds = []
+    all_probs = []
+    all_names = []
+    
+    print("Making simple predictions...")
+    
+    with torch.no_grad():
+        for (rgb_data, ycbcr_data), img_names in tqdm(data_loader, desc='Prediction'):
+            rgb_data = rgb_data.to(device)
+            ycbcr_data = ycbcr_data.to(device)
+            
+            output = model((rgb_data, ycbcr_data))
+            probs = F.softmax(output, dim=1)
+            preds = probs.argmax(dim=1)
+            
+            all_preds.extend(preds.cpu().numpy())
+            all_probs.extend(probs.cpu().numpy())
+            all_names.extend(img_names)
+    
+    return np.array(all_preds), np.array(all_probs), all_names
+
+def load_model(model_path, num_classes=5, dropout_rate=0.5):
+    """
+    Load the trained dual-stream Swin Transformer model
+    """
+    print(f"Loading model from: {model_path}")
+    
+    model = EnhancedSwinDualStreamFusion(
+        num_classes=num_classes,
+        dropout_rate=dropout_rate
+    )
+    
+    checkpoint = torch.load(model_path, map_location=device)
+    
+    if list(checkpoint.keys())[0].startswith('module.'):
+        from collections import OrderedDict
+        new_state_dict = OrderedDict()
+        for k, v in checkpoint.items():
+            name = k[7:]  # remove 'module.'
+            new_state_dict[name] = v
+        checkpoint = new_state_dict
+    
+    model.load_state_dict(checkpoint)
+    model.to(device)
+    model.eval()
+    
+    print("Model loaded successfully!")
+    return model
+
+def create_submission(predictions, probabilities, image_names, output_file='submission.csv'):
+    """
+    Create submission file in the required format
+    """
+    submission_df = pd.DataFrame({
+        'id_code': image_names,
+        'diagnosis': predictions
+    })
+    
+    submission_df = submission_df.sort_values('id_code').reset_index(drop=True)
+    submission_df.to_csv(output_file, index=False)
+    
+    print(f"Submission file saved as: {output_file}")
+    print(f"Total predictions: {len(submission_df)}")
+    
+    print("\nPrediction distribution:")
+    pred_counts = submission_df['diagnosis'].value_counts().sort_index()
+    for class_idx, count in pred_counts.items():
+        percentage = (count / len(submission_df)) * 100
+        print(f"  Class {class_idx}: {count} images ({percentage:.1f}%)")
+    
+    return submission_df
+
+def main():
+    """
+    Main inference pipeline for Swin Transformer RGB+YCbCr model
+    """
+    config = {
+        'model_path': '/kaggle/input/best_swin_dual_stream_model.pth/pytorch/default/1/best_swin_dual_stream_model.pth',  # Updated path
+        'test_csv': '/kaggle/input/aptos2019-blindness-detection/test.csv',
+        'test_img_dir': '/kaggle/input/aptos2019-blindness-detection/test_images',
+        'batch_size': 8,
+        'num_classes': 5,
+        'dropout_rate': 0.5,
+        'image_size': 384,
+        'use_tta': False,  # Set to False for faster inference
+        'num_tta': 8,
+        'output_file': '/kaggle/working/submission.csv'
+    }
+    
+    print("="*70)
+    print("DIABETIC RETINOPATHY DUAL-STREAM RGB+YCbCr INFERENCE WITH SWIN TRANSFORMER")
+    print("="*70)
+    print("Configuration:")
+    print(f"  Model path: {config['model_path']}")
+    print(f"  Test CSV: {config['test_csv']}")
+    print(f"  Test images: {config['test_img_dir']}")
+    print(f"  Batch size: {config['batch_size']}")
+    print(f"  Image size: {config['image_size']}x{config['image_size']}")
+    print(f"  Use TTA: {config['use_tta']}")
+    if config['use_tta']:
+        print(f"  TTA iterations: {config['num_tta']}")
+    print(f"  Output file: {config['output_file']}")
+    print("="*70)
+    
+    model = load_model(
+        config['model_path'], 
+        num_classes=config['num_classes'],
+        dropout_rate=config['dropout_rate']
+    )
+    
+    total_params = sum(p.numel() for p in model.parameters())
+    print(f"Total parameters: {total_params:,}")
+    
+    print("\nLoading test dataset...")
+    test_dataset = TestDataset(
+        csv_file=config['test_csv'],
+        img_dir=config['test_img_dir'],
+        image_size=config['image_size']
+    )
+    
+    test_loader = DataLoader(
+        test_dataset,
+        batch_size=config['batch_size'],
+        shuffle=False,
+        num_workers=4,
+        pin_memory=True,
+        drop_last=False
+    )
+    
+    print(f"\nStarting inference on {len(test_dataset)} images...")
+    
+    if config['use_tta']:
+        predictions, probabilities, image_names = predict_with_tta(
+            model, test_loader, num_tta=config['num_tta']
+        )
+        print(f"TTA inference completed with {config['num_tta']} augmentations per image")
+    else:
+        predictions, probabilities, image_names = make_simple_predictions(
+            model, test_loader
+        )
+        print("Simple inference completed")
+    
+    print("\nCreating submission file...")
+    submission_df = create_submission(
+        predictions, 
+        probabilities, 
+        image_names, 
+        config['output_file']
+    )
+    
+    max_probs = np.max(probabilities, axis=1)
+    print(f"\nConfidence statistics:")
+    print(f"  Mean confidence: {np.mean(max_probs):.4f}")
+    print(f"  Std confidence: {np.std(max_probs):.4f}")
+    print(f"  Min confidence: {np.min(max_probs):.4f}")
+    print(f"  Max confidence: {np.max(max_probs):.4f}")
+    
+    low_confidence_indices = np.argsort(max_probs)[:10]
+    print(f"\n10 predictions with lowest confidence:")
+    for i, idx in enumerate(low_confidence_indices):
+        print(f"  {i+1}. {image_names[idx]}: Class {predictions[idx]} (confidence: {max_probs[idx]:.4f})")
+    
+    print("\n" + "="*70)
+    print("INFERENCE COMPLETED SUCCESSFULLY!")
+    print(f"Submission file: {config['output_file']}")
+    print("="*70)
+    
+    return submission_df
+
+if __name__ == "__main__":
+    submission = main()
