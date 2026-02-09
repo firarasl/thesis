@@ -1,0 +1,405 @@
+import torch
+import torch.nn as nn
+from torch.utils.data import Dataset, DataLoader
+import torchvision.transforms as transforms
+import pandas as pd
+import numpy as np
+import cv2
+from PIL import Image
+import os
+from tqdm import tqdm
+import warnings
+import json
+warnings.filterwarnings('ignore')
+
+# Set device
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+print(f"Using device: {device}")
+
+class DiabeticRetinopathyHVDataset(Dataset):
+    """
+    Dataset for Diabetic Retinopathy with HV (Hue-Value) channels - Test version
+    """
+    def __init__(self, csv_file, img_dir, image_size=384):
+        """
+        Args:
+            csv_file (string): Path to csv with image names
+            img_dir (string): Directory with all images
+            image_size (int): Target image size (384x384)
+        """
+        self.data = pd.read_csv(csv_file)
+        self.img_dir = img_dir
+        self.image_size = image_size
+        
+        print(f"HV Test dataset loaded: {len(self.data)} images")
+        
+    def __len__(self):
+        return len(self.data)
+    
+    def __getitem__(self, idx):
+        if torch.is_tensor(idx):
+            idx = idx.tolist()
+            
+        # Get image name (for test dataset, the column name might be 'id_code')
+        if 'id_code' in self.data.columns:
+            img_name = self.data.iloc[idx]['id_code']
+        else:
+            img_name = self.data.iloc[idx, 0]
+        
+        # Try different extensions
+        img_extensions = ['.png', '.jpg', '.jpeg']
+        img_path = None
+        
+        for ext in img_extensions:
+            potential_path = os.path.join(self.img_dir, f"{img_name}{ext}")
+            if os.path.exists(potential_path):
+                img_path = potential_path
+                break
+                
+        if img_path is None:
+            raise FileNotFoundError(f"Image {img_name} not found with any extension")
+        
+        try:
+            # Load image
+            image = cv2.imread(img_path)
+            if image is None:
+                raise ValueError(f"Could not load image: {img_path}")
+            
+            # Convert BGR to RGB
+            image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+            
+            # Convert RGB to HSV
+            image_hsv = cv2.cvtColor(image_rgb, cv2.COLOR_RGB2HSV)
+            
+            # Extract Hue and Value channels (H and V)
+            image_hv = image_hsv[:, :, [0, 2]]  # H, V channels
+            
+            # Resize to target size
+            image_hv_resized = cv2.resize(image_hv, (self.image_size, self.image_size))
+            
+            # Convert to PIL Image for transforms
+            image_pil = Image.fromarray(image_hv_resized.astype('uint8'))
+            
+            # Convert to tensor and normalize
+            image_tensor = transforms.ToTensor()(image_pil)
+            
+            # Normalize with HV-specific stats (same as training)
+            image_tensor = transforms.Normalize(
+                mean=[0.5, 0.5],  # H, V channel means
+                std=[0.3, 0.3]    # H, V channel stds
+            )(image_tensor)
+            
+        except Exception as e:
+            print(f"Error loading image {img_name}: {e}")
+            # Return a dummy tensor in case of error
+            image_tensor = torch.zeros((2, self.image_size, self.image_size), dtype=torch.float32)
+            
+        return image_tensor, img_name
+
+class HVChannelSEResNeXtModel(nn.Module):
+    """
+    SE-ResNeXt model for HV (Hue-Value) channels
+    """
+    def __init__(self, num_classes=5, dropout_rate=0.5):
+        super(HVChannelSEResNeXtModel, self).__init__()
+        
+        # Import timm locally
+        import timm
+        
+        # Load pretrained SE-ResNeXt
+        self.backbone = timm.create_model(
+            'seresnext26d_32x4d', 
+            pretrained=False,  # We'll load weights from file
+            num_classes=0,     # Remove classification head
+            in_chans=2         # 2 input channels for HV
+        )
+        feature_dim = self.backbone.num_features
+        
+        # Classifier with enhanced regularization
+        self.classifier = nn.Sequential(
+            nn.Dropout(dropout_rate),
+            nn.Linear(feature_dim, 1024),
+            nn.ReLU(inplace=True),
+            nn.BatchNorm1d(1024),
+            nn.Dropout(dropout_rate/2),
+            nn.Linear(1024, 512),
+            nn.ReLU(inplace=True),
+            nn.BatchNorm1d(512),
+            nn.Dropout(dropout_rate/2),
+            nn.Linear(512, num_classes)
+        )
+    
+    def forward(self, x):
+        # Extract features
+        features = self.backbone(x)
+        
+        # Final classification
+        output = self.classifier(features)
+        
+        return output
+
+def safe_load_model(model_path, device):
+    """
+    Safely load model with proper error handling for PyTorch 2.6+
+    """
+    try:
+        # First try with weights_only=True (safer)
+        checkpoint = torch.load(model_path, map_location=device, weights_only=True)
+        print("Model loaded with weights_only=True (safe mode)")
+        return checkpoint
+    except Exception as e:
+        print(f"weights_only=True failed: {e}")
+        print("Trying with weights_only=False (requires trust in the model source)")
+        try:
+            # If that fails, try with weights_only=False (less safe but compatible)
+            checkpoint = torch.load(model_path, map_location=device, weights_only=False)
+            print("Model loaded with weights_only=False")
+            return checkpoint
+        except Exception as e2:
+            print(f"weights_only=False also failed: {e2}")
+            raise
+
+def load_hv_model(model_path, num_classes=5, dropout_rate=0.5):
+    """
+    Load the trained HV SE-ResNeXt model
+    """
+    print(f"Loading HV SE-ResNeXt model from: {model_path}")
+    
+    # Initialize model
+    model = HVChannelSEResNeXtModel(
+        num_classes=num_classes,
+        dropout_rate=dropout_rate
+    )
+    
+    # Load state dict with safe loading
+    checkpoint = safe_load_model(model_path, device)
+    
+    # Handle different checkpoint formats
+    if isinstance(checkpoint, dict):
+        if 'model_state_dict' in checkpoint:
+            model.load_state_dict(checkpoint['model_state_dict'])
+            print("Loaded model from model_state_dict")
+        elif 'state_dict' in checkpoint:
+            model.load_state_dict(checkpoint['state_dict'])
+            print("Loaded model from state_dict")
+        else:
+            # Assume it's the full state dict
+            model.load_state_dict(checkpoint)
+            print("Loaded model from state dict")
+    else:
+        model.load_state_dict(checkpoint)
+        print("Loaded model from checkpoint")
+    
+    model.to(device)
+    model.eval()
+    
+    print("HV SE-ResNeXt model loaded successfully!")
+    
+    # Print model info
+    total_params = sum(p.numel() for p in model.parameters())
+    print(f"Model parameters: {total_params:,}")
+    
+    return model
+
+def perform_hv_inference(model, test_loader, use_tta=True):
+    """
+    Perform inference on test dataset with optional Test Time Augmentation for HV model
+    """
+    model.eval()
+    predictions = []
+    image_names = []
+    all_probabilities = []
+    
+    print("Performing HV inference...")
+    
+    with torch.no_grad():
+        for data, img_names in tqdm(test_loader, desc="HV Inference"):
+            data = data.to(device)
+            
+            if use_tta:
+                # Test Time Augmentation for HV model
+                tta_predictions = []
+                
+                # Original
+                output = model(data)
+                tta_predictions.append(torch.softmax(output, dim=1))
+                
+                # Horizontal flip
+                data_flipped = torch.flip(data, dims=[3])
+                output_flipped = model(data_flipped)
+                tta_predictions.append(torch.softmax(output_flipped, dim=1))
+                
+                # Vertical flip
+                data_vflipped = torch.flip(data, dims=[2])
+                output_vflipped = model(data_vflipped)
+                tta_predictions.append(torch.softmax(output_vflipped, dim=1))
+                
+                # Average predictions
+                avg_prediction = torch.mean(torch.stack(tta_predictions), dim=0)
+                pred_classes = avg_prediction.argmax(dim=1)
+                probabilities = avg_prediction.cpu().numpy()
+                
+            else:
+                # No TTA - single prediction
+                output = model(data)
+                pred_classes = output.argmax(dim=1)
+                probabilities = torch.softmax(output, dim=1).cpu().numpy()
+            
+            predictions.extend(pred_classes.cpu().numpy())
+            image_names.extend(img_names)
+            all_probabilities.extend(probabilities)
+    
+    return predictions, image_names, np.array(all_probabilities)
+
+def create_submission(predictions, image_names, output_file='hv_seresnext_submission.csv'):
+    """
+    Create submission CSV file
+    """
+    print(f"Creating HV submission file: {output_file}")
+    
+    # Create submission dataframe
+    submission_df = pd.DataFrame({
+        'id_code': image_names,
+        'diagnosis': predictions
+    })
+    
+    # Save submission
+    submission_df.to_csv(output_file, index=False)
+    
+    print(f"HV Submission file created with {len(submission_df)} predictions")
+    
+    # Print prediction distribution
+    print("\nHV Model Prediction distribution:")
+    label_names = ['No DR', 'Mild', 'Moderate', 'Severe', 'Proliferative']
+    for i, label in enumerate(label_names):
+        count = (submission_df['diagnosis'] == i).sum()
+        percentage = count / len(submission_df) * 100
+        print(f"  Class {i} ({label}): {count} images ({percentage:.1f}%)")
+    
+    return submission_df
+
+def save_probability_analysis(predictions, probabilities, image_names, output_file='hv_seresnext_probabilities.csv'):
+    """
+    Save probability analysis for debugging and analysis
+    """
+    prob_df = pd.DataFrame(probabilities, columns=[f'class_{i}_prob' for i in range(5)])
+    prob_df['id_code'] = image_names
+    prob_df['prediction'] = predictions
+    
+    # Calculate confidence scores (max probability)
+    prob_df['confidence'] = np.max(probabilities, axis=1)
+    
+    # Reorder columns
+    cols = ['id_code', 'prediction', 'confidence'] + [f'class_{i}_prob' for i in range(5)]
+    prob_df = prob_df[cols]
+    
+    prob_df.to_csv(output_file, index=False)
+    print(f"HV Probability analysis saved: {output_file}")
+    
+    return prob_df
+
+def main():
+    """
+    Main inference pipeline for HV SE-ResNeXt
+    """
+    # Configuration - UPDATE THESE PATHS FOR YOUR KAGGLE NOTEBOOK
+    config = {
+        'model_path': '/kaggle/input/hv-se-resnext26-training/best_hv_seresnext_model.pth',  # Update this path
+        'test_csv': '/kaggle/input/aptos2019-blindness-detection/test.csv',
+        'test_img_dir': '/kaggle/input/aptos2019-blindness-detection/test_images',
+        'batch_size': 16,
+        'num_classes': 5,
+        'dropout_rate': 0.5,
+        'image_size': 384,
+        'use_tta': True,  # Use Test Time Augmentation
+        'output_file': 'submission.csv',
+        'save_probabilities': True
+    }
+    
+    print("="*70)
+    print("HV SE-RESNEXT DIABETIC RETINOPATHY INFERENCE")
+    print("="*70)
+    print(f"Model: HV SE-ResNeXt-26x4d (2-channel Hue-Value)")
+    print(f"Input channels: 2 (Hue + Value from HSV)")
+    print(f"Model path: {config['model_path']}")
+    print(f"Test CSV: {config['test_csv']}")
+    print(f"Test images: {config['test_img_dir']}")
+    print(f"Batch size: {config['batch_size']}")
+    print(f"Image size: {config['image_size']}x{config['image_size']}")
+    print(f"TTA enabled: {config['use_tta']}")
+    print("="*70)
+    
+    # Check if model file exists
+    if not os.path.exists(config['model_path']):
+        print(f"Error: Model file not found at {config['model_path']}")
+        print("Please make sure the model file exists or update the model_path in the config.")
+        return
+    
+    # Load model
+    model = load_hv_model(
+        config['model_path'],
+        num_classes=config['num_classes'],
+        dropout_rate=config['dropout_rate']
+    )
+    
+    # Create test dataset
+    print("\nLoading HV test dataset...")
+    test_dataset = DiabeticRetinopathyHVDataset(
+        csv_file=config['test_csv'],
+        img_dir=config['test_img_dir'],
+        image_size=config['image_size']
+    )
+    
+    # Create test data loader
+    test_loader = DataLoader(
+        test_dataset,
+        batch_size=config['batch_size'],
+        shuffle=False,
+        num_workers=4,
+        pin_memory=True
+    )
+    
+    # Perform inference
+    print("\nStarting inference with HV SE-ResNeXt...")
+    predictions, image_names, probabilities = perform_hv_inference(
+        model, 
+        test_loader, 
+        use_tta=config['use_tta']
+    )
+    
+    # Create submission file
+    submission_df = create_submission(
+        predictions, 
+        image_names, 
+        config['output_file']
+    )
+    
+    # Save probability analysis if requested
+    if config['save_probabilities']:
+        print("\nSaving probability analysis...")
+        prob_df = save_probability_analysis(
+            predictions, 
+            probabilities, 
+            image_names,
+            'hv_seresnext_probabilities.csv'
+        )
+    
+    print(f"\nHV Inference completed successfully!")
+    print(f"Submission file saved: {config['output_file']}")
+    print(f"Total test images processed: {len(predictions)}")
+    print(f"Input type: 2-channel HV (Hue-Value)")
+    print(f"Model: SE-ResNeXt-26x4d adapted for HV channels")
+    
+    # Display first few predictions
+    print("\nFirst 10 predictions:")
+    print(submission_df.head(10))
+    
+    return submission_df
+
+if __name__ == "__main__":
+    # Set random seeds for reproducibility
+    torch.manual_seed(42)
+    np.random.seed(42)
+    
+    # Run inference
+    submission_df = main()
