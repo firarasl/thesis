@@ -1,0 +1,392 @@
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader
+import torchvision.transforms as transforms
+from torchvision import models
+import pandas as pd
+import numpy as np
+import cv2
+from PIL import Image
+import os
+from tqdm import tqdm
+import warnings
+import random
+warnings.filterwarnings('ignore')
+
+# Set device
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+print(f"Using device: {device}")
+
+def crop_black_background(image, threshold=10):
+    """
+    Crop black background from retinal images
+    """
+    # Convert to grayscale for processing
+    if len(image.shape) == 3:
+        gray = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
+    else:
+        gray = image
+    
+    # Create mask for non-black pixels
+    mask = gray > threshold
+    
+    # Find bounding box of non-black region
+    coords = np.argwhere(mask)
+    if len(coords) == 0:
+        return image  # Return original if no non-black pixels found
+    
+    y0, x0 = coords.min(axis=0)
+    y1, x1 = coords.max(axis=0) + 1
+    
+    # Crop the image
+    cropped = image[y0:y1, x0:x1]
+    
+    return cropped
+
+class CustomAugmentations:
+    """
+    Custom augmentation pipeline - for inference, we only need the non-training version
+    """
+    def __init__(self, is_training=False):
+        self.is_training = is_training
+    
+    def __call__(self, image):
+        # For inference, no augmentations are applied
+        return image
+
+class DiabeticRetinopathyRGBHSVDataset(Dataset):
+    """
+    Enhanced Dataset for Diabetic Retinopathy with RGB + HSV fusion - Test version
+    """
+    def __init__(self, csv_file, img_dir, transform=None, is_test=True, image_size=384):
+        """
+        Args:
+            csv_file (string): Path to csv with image names
+            img_dir (string): Directory with all images
+            transform (callable, optional): Transform to be applied on images
+            is_test (bool): Whether this is test dataset (no labels)
+            image_size (int): Target image size (384x384)
+        """
+        self.data = pd.read_csv(csv_file)
+        self.img_dir = img_dir
+        self.transform = transform
+        self.is_test = is_test
+        self.image_size = image_size
+        
+        print(f"Test dataset loaded: {len(self.data)} images")
+        
+    def __len__(self):
+        return len(self.data)
+    
+    def preprocess_image(self, image_path):
+        """
+        Enhanced preprocessing with black background cropping
+        """
+        # Load image
+        image = cv2.imread(image_path)
+        if image is None:
+            raise ValueError(f"Could not load image: {image_path}")
+        
+        # Convert BGR to RGB
+        image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        
+        # Crop black background
+        image = crop_black_background(image, threshold=10)
+        
+        # Resize to target size
+        image = cv2.resize(image, (self.image_size, self.image_size))
+        
+        return image
+    
+    def rgb_to_hsv_tensor(self, rgb_image):
+        """
+        Convert RGB image to HSV
+        """
+        # Convert RGB to HSV
+        hsv_image = cv2.cvtColor(rgb_image, cv2.COLOR_RGB2HSV)
+        return hsv_image
+    
+    def __getitem__(self, idx):
+        if torch.is_tensor(idx):
+            idx = idx.tolist()
+            
+        # Get image name (for test dataset, the column name might be 'id_code')
+        if 'id_code' in self.data.columns:
+            img_name = self.data.iloc[idx]['id_code']
+        else:
+            img_name = self.data.iloc[idx, 0]
+        
+        # Try different extensions
+        img_extensions = ['.png', '.jpg', '.jpeg']
+        img_path = None
+        
+        for ext in img_extensions:
+            potential_path = os.path.join(self.img_dir, f"{img_name}{ext}")
+            if os.path.exists(potential_path):
+                img_path = potential_path
+                break
+                
+        if img_path is None:
+            raise FileNotFoundError(f"Image {img_name} not found with any extension")
+        
+        # Load and preprocess image
+        rgb_image = self.preprocess_image(img_path)
+        
+        # Convert to HSV
+        hsv_image = self.rgb_to_hsv_tensor(rgb_image)
+        
+        # Convert to tensors
+        rgb_tensor = torch.from_numpy(rgb_image.transpose(2, 0, 1)).float() / 255.0
+        hsv_tensor = torch.from_numpy(hsv_image.transpose(2, 0, 1)).float() / 255.0
+        
+        # Normalize both with ImageNet stats
+        rgb_tensor = transforms.Normalize(
+            mean=[0.485, 0.456, 0.406], 
+            std=[0.229, 0.224, 0.225]
+        )(rgb_tensor)
+        
+        hsv_tensor = transforms.Normalize(
+            mean=[0.485, 0.456, 0.406], 
+            std=[0.229, 0.224, 0.225]
+        )(hsv_tensor)
+        
+        # Return as tuple for dual-stream processing
+        return (rgb_tensor, hsv_tensor), img_name
+
+class DualStreamRGBHSVFusion(nn.Module):
+    """
+    Dual-stream architecture that preserves ImageNet weights for both RGB and HSV streams
+    """
+    def __init__(self, num_classes=5, dropout_rate=0.5):
+        super(DualStreamRGBHSVFusion, self).__init__()
+        
+        # RGB stream - keeps original ImageNet weights
+        self.rgb_backbone = models.resnet50(pretrained=False)
+        rgb_features = self.rgb_backbone.fc.in_features
+        self.rgb_backbone.fc = nn.Identity()  # Remove final FC layer
+        
+        # HSV stream - separate ResNet50 for HSV
+        self.hsv_backbone = models.resnet50(pretrained=False)
+        hsv_features = self.hsv_backbone.fc.in_features
+        self.hsv_backbone.fc = nn.Identity()  # Remove final FC layer
+        
+        # Fusion layer
+        combined_features = rgb_features + hsv_features  # 2048 + 2048 = 4096
+        
+        # Final classifier with enhanced regularization
+        self.classifier = nn.Sequential(
+            nn.Dropout(dropout_rate),
+            nn.Linear(combined_features, 1024),
+            nn.ReLU(inplace=True),
+            nn.Dropout(dropout_rate/2),
+            nn.Linear(1024, 512),
+            nn.ReLU(inplace=True),
+            nn.Dropout(dropout_rate/2),
+            nn.Linear(512, num_classes)
+        )
+        
+        # Initialize new layers
+        for m in self.classifier.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight)
+                nn.init.constant_(m.bias, 0)
+    
+    def forward(self, x):
+        # x is a tuple of (rgb_tensor, hsv_tensor)
+        rgb, hsv = x
+        
+        # Extract features from both streams
+        rgb_features = self.rgb_backbone(rgb)
+        hsv_features = self.hsv_backbone(hsv)
+        
+        # Concatenate features
+        combined_features = torch.cat([rgb_features, hsv_features], dim=1)
+        
+        # Final classification
+        output = self.classifier(combined_features)
+        
+        return output
+
+def load_model(model_path, num_classes=5, dropout_rate=0.5):
+    """
+    Load the trained dual-stream model
+    """
+    print(f"Loading model from: {model_path}")
+    
+    # Initialize model
+    model = DualStreamRGBHSVFusion(
+        num_classes=num_classes,
+        dropout_rate=dropout_rate
+    )
+    
+    # Load state dict
+    if torch.cuda.is_available():
+        state_dict = torch.load(model_path)
+    else:
+        state_dict = torch.load(model_path, map_location='cpu')
+    
+    model.load_state_dict(state_dict)
+    model.to(device)
+    model.eval()
+    
+    print("Model loaded successfully!")
+    return model
+
+def perform_inference(model, test_loader, use_tta=True):
+    """
+    Perform inference on test dataset with optional Test Time Augmentation
+    """
+    model.eval()
+    predictions = []
+    image_names = []
+    
+    print("Performing inference...")
+    
+    with torch.no_grad():
+        for data, img_names in tqdm(test_loader, desc="Inference"):
+            rgb_data, hsv_data = data
+            rgb_data = rgb_data.to(device)
+            hsv_data = hsv_data.to(device)
+            
+            if use_tta:
+                # Test Time Augmentation - apply multiple transformations and average
+                tta_predictions = []
+                
+                # Original
+                output = model((rgb_data, hsv_data))
+                tta_predictions.append(torch.softmax(output, dim=1))
+                
+                # Horizontal flip
+                rgb_flipped = torch.flip(rgb_data, dims=[3])
+                hsv_flipped = torch.flip(hsv_data, dims=[3])
+                output_flipped = model((rgb_flipped, hsv_flipped))
+                tta_predictions.append(torch.softmax(output_flipped, dim=1))
+                
+                # Vertical flip
+                rgb_vflipped = torch.flip(rgb_data, dims=[2])
+                hsv_vflipped = torch.flip(hsv_data, dims=[2])
+                output_vflipped = model((rgb_vflipped, hsv_vflipped))
+                tta_predictions.append(torch.softmax(output_vflipped, dim=1))
+                
+                # Average predictions
+                avg_prediction = torch.mean(torch.stack(tta_predictions), dim=0)
+                pred_classes = avg_prediction.argmax(dim=1)
+                
+            else:
+                # No TTA - single prediction
+                output = model((rgb_data, hsv_data))
+                pred_classes = output.argmax(dim=1)
+            
+            predictions.extend(pred_classes.cpu().numpy())
+            image_names.extend(img_names)
+    
+    return predictions, image_names
+
+def create_submission(predictions, image_names, output_file='submission.csv'):
+    """
+    Create submission CSV file
+    """
+    print(f"Creating submission file: {output_file}")
+    
+    # Create submission dataframe
+    submission_df = pd.DataFrame({
+        'id_code': image_names,
+        'diagnosis': predictions
+    })
+    
+    # Save submission
+    submission_df.to_csv(output_file, index=False)
+    
+    print(f"Submission file created with {len(submission_df)} predictions")
+    print(f"Prediction distribution:")
+    print(submission_df['diagnosis'].value_counts().sort_index())
+    
+    return submission_df
+
+def main():
+    """
+    Main inference pipeline
+    """
+    # Configuration
+    config = {
+        'model_path': '/kaggle/input/rgb-hsv-6-channel/best_dual_stream_model.pth',
+        'test_csv': '/kaggle/input/aptos2019-blindness-detection/test.csv',
+        'test_img_dir': '/kaggle/input/aptos2019-blindness-detection/test_images',
+        'batch_size': 32,  # Larger batch size for faster inference
+        'num_classes': 5,
+        'dropout_rate': 0.5,
+        'image_size': 384,
+        'use_tta': True,  # Use Test Time Augmentation
+        'output_file': 'submission.csv'
+    }
+    
+    print("="*70)
+    print("DUAL-STREAM DIABETIC RETINOPATHY INFERENCE")
+    print("="*70)
+    print(f"Model path: {config['model_path']}")
+    print(f"Test CSV: {config['test_csv']}")
+    print(f"Test images: {config['test_img_dir']}")
+    print(f"Batch size: {config['batch_size']}")
+    print(f"Image size: {config['image_size']}x{config['image_size']}")
+    print(f"TTA enabled: {config['use_tta']}")
+    print("="*70)
+    
+    # Load model
+    model = load_model(
+        config['model_path'],
+        num_classes=config['num_classes'],
+        dropout_rate=config['dropout_rate']
+    )
+    
+    # Create test dataset
+    print("\nLoading test dataset...")
+    test_dataset = DiabeticRetinopathyRGBHSVDataset(
+        csv_file=config['test_csv'],
+        img_dir=config['test_img_dir'],
+        transform=None,  # No augmentations for test
+        is_test=True,
+        image_size=config['image_size']
+    )
+    
+    # Create test data loader
+    test_loader = DataLoader(
+        test_dataset,
+        batch_size=config['batch_size'],
+        shuffle=False,
+        num_workers=4,
+        pin_memory=True
+    )
+    
+    # Perform inference
+    print("\nStarting inference...")
+    predictions, image_names = perform_inference(
+        model, 
+        test_loader, 
+        use_tta=config['use_tta']
+    )
+    
+    # Create submission file
+    submission_df = create_submission(
+        predictions, 
+        image_names, 
+        config['output_file']
+    )
+    
+    print(f"\nInference completed successfully!")
+    print(f"Submission file saved: {config['output_file']}")
+    
+    # Display first few predictions
+    print("\nFirst 10 predictions:")
+    print(submission_df.head(10))
+    
+    return submission_df
+
+if __name__ == "__main__":
+    # Set random seeds for reproducibility
+    torch.manual_seed(42)
+    np.random.seed(42)
+    random.seed(42)
+    
+    # Run inference
+    submission_df = main()
