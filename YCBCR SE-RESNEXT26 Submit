@@ -1,0 +1,475 @@
+import torch
+import torch.nn as nn
+from torch.utils.data import Dataset, DataLoader
+import torchvision.transforms as transforms
+import pandas as pd
+import numpy as np
+import cv2
+from PIL import Image
+import os
+from tqdm import tqdm
+import warnings
+warnings.filterwarnings('ignore')
+
+# Set device
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+print(f"Using device: {device}")
+
+class DiabeticRetinopathyYCbCrDataset(Dataset):
+    """
+    Custom Dataset for Diabetic Retinopathy with YCbCr images (Test Dataset)
+    """
+    def __init__(self, csv_file, img_dir, transform=None):
+        """
+        Args:
+            csv_file (string): Path to csv with image names
+            img_dir (string): Directory with all images
+            transform (callable, optional): Transform to be applied on images
+        """
+        self.data = pd.read_csv(csv_file)
+        self.img_dir = img_dir
+        self.transform = transform
+        
+        print(f"Test dataset loaded: {len(self.data)} images")
+        
+    def __len__(self):
+        return len(self.data)
+    
+    def rgb_to_ycbcr(self, rgb_image):
+        """
+        Convert RGB image to YCbCr color space using OpenCV
+        """
+        # Convert PIL Image to numpy array if needed
+        if isinstance(rgb_image, Image.Image):
+            rgb_array = np.array(rgb_image)
+        else:
+            rgb_array = rgb_image
+            
+        # Convert RGB to YCbCr using OpenCV
+        ycbcr_array = cv2.cvtColor(rgb_array, cv2.COLOR_RGB2YCrCb)
+        
+        # Note: OpenCV returns YCrCb, but we want YCbCr, so we need to swap channels
+        # YCrCb has channels: Y, Cr, Cb
+        # YCbCr has channels: Y, Cb, Cr
+        # So we need to swap the last two channels
+        y_channel = ycbcr_array[:, :, 0]
+        cr_channel = ycbcr_array[:, :, 1]  # This is Cr
+        cb_channel = ycbcr_array[:, :, 2]  # This is Cb
+        
+        # Rearrange to YCbCr format
+        ycbcr_correct = np.stack([y_channel, cb_channel, cr_channel], axis=2)
+        
+        return Image.fromarray(ycbcr_correct)
+    
+    def __getitem__(self, idx):
+        if torch.is_tensor(idx):
+            idx = idx.tolist()
+            
+        # Get image name (assuming the CSV has 'id_code' column)
+        img_name = self.data.iloc[idx, 0]  # First column should be image ID
+        
+        # Try different extensions
+        img_extensions = ['.png', '.jpg', '.jpeg']
+        img_path = None
+        
+        for ext in img_extensions:
+            potential_path = os.path.join(self.img_dir, f"{img_name}{ext}")
+            if os.path.exists(potential_path):
+                img_path = potential_path
+                break
+                
+        if img_path is None:
+            raise FileNotFoundError(f"Image {img_name} not found with any extension")
+        
+        # Load image in standard RGB format
+        image = cv2.imread(img_path)
+        if image is None:
+            raise ValueError(f"Could not load image: {img_path}")
+        
+        # Convert BGR (OpenCV default) to RGB
+        image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        
+        # Convert to PIL Image for transforms
+        image = Image.fromarray(image)
+        
+        # Convert RGB to YCbCr
+        image = self.rgb_to_ycbcr(image)
+        
+        if self.transform:
+            image = self.transform(image)
+            
+        return image, img_name
+
+class SEBlock(nn.Module):
+    """
+    Squeeze-and-Excitation Block
+    """
+    def __init__(self, channels, reduction=16):
+        super(SEBlock, self).__init__()
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.fc = nn.Sequential(
+            nn.Linear(channels, channels // reduction, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Linear(channels // reduction, channels, bias=False),
+            nn.Sigmoid()
+        )
+
+    def forward(self, x):
+        b, c, _, _ = x.size()
+        y = self.avg_pool(x).view(b, c)
+        y = self.fc(y).view(b, c, 1, 1)
+        return x * y.expand_as(x)
+
+class ResNeXtBottleneck(nn.Module):
+    """
+    ResNeXt Bottleneck Block with SE
+    """
+    expansion = 4
+
+    def __init__(self, in_channels, out_channels, stride=1, cardinality=32, base_width=4):
+        super(ResNeXtBottleneck, self).__init__()
+        width = int(out_channels * (base_width / 64.)) * cardinality
+        
+        self.conv1 = nn.Conv2d(in_channels, width, kernel_size=1, bias=False)
+        self.bn1 = nn.BatchNorm2d(width)
+        
+        self.conv2 = nn.Conv2d(width, width, kernel_size=3, stride=stride, 
+                              padding=1, groups=cardinality, bias=False)
+        self.bn2 = nn.BatchNorm2d(width)
+        
+        self.conv3 = nn.Conv2d(width, out_channels * self.expansion, kernel_size=1, bias=False)
+        self.bn3 = nn.BatchNorm2d(out_channels * self.expansion)
+        
+        self.se = SEBlock(out_channels * self.expansion)
+        
+        self.relu = nn.ReLU(inplace=True)
+        
+        # Shortcut connection
+        self.shortcut = nn.Sequential()
+        if stride != 1 or in_channels != out_channels * self.expansion:
+            self.shortcut = nn.Sequential(
+                nn.Conv2d(in_channels, out_channels * self.expansion, 
+                         kernel_size=1, stride=stride, bias=False),
+                nn.BatchNorm2d(out_channels * self.expansion)
+            )
+
+    def forward(self, x):
+        residual = self.shortcut(x)
+        
+        out = self.conv1(x)
+        out = self.bn1(out)
+        out = self.relu(out)
+        
+        out = self.conv2(out)
+        out = self.bn2(out)
+        out = self.relu(out)
+        
+        out = self.conv3(out)
+        out = self.bn3(out)
+        
+        # Apply SE block
+        out = self.se(out)
+        
+        out += residual
+        out = self.relu(out)
+        
+        return out
+
+class SEResNeXt26(nn.Module):
+    """
+    SE-ResNeXt26 (26×4d) for YCbCr Diabetic Retinopathy Classification
+    """
+    def __init__(self, num_classes=5, cardinality=32, base_width=4):
+        super(SEResNeXt26, self).__init__()
+        self.cardinality = cardinality
+        self.base_width = base_width
+        
+        # Initial layers
+        self.conv1 = nn.Conv2d(3, 64, kernel_size=7, stride=2, padding=3, bias=False)
+        self.bn1 = nn.BatchNorm2d(64)
+        self.relu = nn.ReLU(inplace=True)
+        self.maxpool = nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
+        
+        # Residual layers
+        self.layer1 = self._make_layer(64, 64, 2, stride=1)
+        self.layer2 = self._make_layer(256, 128, 2, stride=2)
+        self.layer3 = self._make_layer(512, 256, 2, stride=2)
+        self.layer4 = self._make_layer(1024, 512, 2, stride=2)
+        
+        # Classifier
+        self.avgpool = nn.AdaptiveAvgPool2d(1)
+        self.dropout = nn.Dropout(0.5)
+        self.fc = nn.Linear(2048, num_classes)
+        
+        # Initialize weights
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+            elif isinstance(m, nn.BatchNorm2d):
+                nn.init.constant_(m.weight, 1)
+                nn.init.constant_(m.bias, 0)
+
+    def _make_layer(self, in_channels, out_channels, blocks, stride=1):
+        layers = []
+        layers.append(ResNeXtBottleneck(in_channels, out_channels, stride, 
+                                      self.cardinality, self.base_width))
+        
+        for _ in range(1, blocks):
+            layers.append(ResNeXtBottleneck(out_channels * 4, out_channels, 
+                                          1, self.cardinality, self.base_width))
+        
+        return nn.Sequential(*layers)
+
+    def forward(self, x):
+        x = self.conv1(x)
+        x = self.bn1(x)
+        x = self.relu(x)
+        x = self.maxpool(x)
+        
+        x = self.layer1(x)
+        x = self.layer2(x)
+        x = self.layer3(x)
+        x = self.layer4(x)
+        
+        x = self.avgpool(x)
+        x = torch.flatten(x, 1)
+        x = self.dropout(x)
+        x = self.fc(x)
+        
+        return x
+
+def get_ycbcr_test_transforms():
+    """
+    Define preprocessing transforms for test images (no augmentation)
+    Uses YCbCr-specific normalization
+    """
+    # Custom normalization values for YCbCr color space
+    ycbcr_mean = [0.5, 0.5, 0.5]  # Normalized to [0,1] range
+    ycbcr_std = [0.25, 0.25, 0.25]  # Conservative standard deviation
+    
+    test_transforms = transforms.Compose([
+        transforms.Resize((512, 512)),  # SE-ResNeXt26 uses 512x512
+        transforms.ToTensor(),
+        transforms.Normalize(mean=ycbcr_mean, std=ycbcr_std)
+    ])
+    
+    return test_transforms
+
+def load_trained_model(model_path, num_classes=5, cardinality=32, base_width=4):
+    """
+    Load the pre-trained YCbCr SE-ResNeXt26 model
+    """
+    print(f"Loading model from: {model_path}")
+    
+    # Initialize model architecture
+    model = SEResNeXt26(
+        num_classes=num_classes,
+        cardinality=cardinality,
+        base_width=base_width
+    )
+    
+    # Load trained weights
+    checkpoint = torch.load(model_path, map_location=device)
+    
+    # Handle state dict format
+    if 'state_dict' in checkpoint:
+        model.load_state_dict(checkpoint['state_dict'])
+    else:
+        model.load_state_dict(checkpoint)
+        
+    model.to(device)
+    model.eval()
+    
+    print("SE-ResNeXt26 model loaded successfully!")
+    return model
+
+def generate_predictions(model, test_loader, use_tta=False):
+    """
+    Generate predictions for test set
+    
+    Args:
+        model: Trained model
+        test_loader: DataLoader for test set
+        use_tta: Whether to use Test Time Augmentation (TTA)
+    """
+    model.eval()
+    predictions = []
+    image_names = []
+    all_probabilities = []
+    
+    print("Generating predictions...")
+    
+    with torch.no_grad():
+        for data, names in tqdm(test_loader, desc="Processing test images"):
+            data = data.to(device)
+            
+            if use_tta:
+                # Test Time Augmentation
+                outputs = model(data)
+                
+                # Horizontal flip
+                outputs += model(torch.flip(data, dims=[3]))
+                
+                # Vertical flip
+                outputs += model(torch.flip(data, dims=[2]))
+                
+                # Average the predictions
+                outputs = outputs / 3.0
+            else:
+                outputs = model(data)
+            
+            # Convert logits to probabilities
+            probs = torch.softmax(outputs, dim=1)
+            
+            # Get predicted classes
+            preds = probs.argmax(dim=1)
+            
+            predictions.extend(preds.cpu().numpy())
+            image_names.extend(names)
+            all_probabilities.extend(probs.cpu().numpy())
+    
+    return predictions, image_names, np.array(all_probabilities)
+
+def create_submission_file(predictions, image_names, output_file='submission.csv'):
+    """
+    Create submission file in Kaggle format
+    """
+    submission_df = pd.DataFrame({
+        'id_code': image_names,
+        'diagnosis': predictions
+    })
+    
+    # Sort by id_code to ensure consistent ordering
+    submission_df = submission_df.sort_values('id_code')
+    
+    # Save to CSV
+    submission_df.to_csv(output_file, index=False)
+    
+    print(f"Submission file saved: {output_file}")
+    print(f"Total predictions: {len(submission_df)}")
+    
+    # Print prediction distribution
+    print("\nPrediction distribution:")
+    label_names = ['No DR', 'Mild', 'Moderate', 'Severe', 'Proliferative']
+    for i, label in enumerate(label_names):
+        count = (submission_df['diagnosis'] == i).sum()
+        percentage = count / len(submission_df) * 100
+        print(f"  Class {i} ({label}): {count} images ({percentage:.1f}%)")
+    
+    return submission_df
+
+def main():
+    """
+    Main inference pipeline for YCbCr SE-ResNeXt26 model
+    """
+    # Configuration
+    config = {
+        'model_path': '/kaggle/input/ycbcr-se-resnext26-26-4d-training/best_seresnext26_ycbcr_model.pth',  # Update with your model path
+        'test_csv': '/kaggle/input/aptos2019-blindness-detection/test.csv',
+        'test_img_dir': '/kaggle/input/aptos2019-blindness-detection/test_images',
+        'batch_size': 16,
+        'num_classes': 5,
+        'cardinality': 32,
+        'base_width': 4,
+        'use_tta': True,  # Use Test Time Augmentation for better results
+        'output_file': 'submission.csv'
+    }
+    
+    print("="*70)
+    print("DIABETIC RETINOPATHY YCbCr SE-RESNEXT26 MODEL - INFERENCE")
+    print("="*70)
+    print("Configuration:")
+    for key, value in config.items():
+        print(f"  {key}: {value}")
+    print("="*70)
+    
+    # Check if test files exist
+    if not os.path.exists(config['test_csv']):
+        print(f"Error: Test CSV file not found at {config['test_csv']}")
+        return
+    
+    if not os.path.exists(config['test_img_dir']):
+        print(f"Error: Test images directory not found at {config['test_img_dir']}")
+        return
+    
+    if not os.path.exists(config['model_path']):
+        print(f"Error: Model file not found at {config['model_path']}")
+        print("Please make sure the model file exists or update the model_path in the config.")
+        return
+    
+    # Load trained model
+    model = load_trained_model(
+        config['model_path'], 
+        config['num_classes'], 
+        config['cardinality'], 
+        config['base_width']
+    )
+    
+    # Get YCbCr-specific test transforms
+    test_transforms = get_ycbcr_test_transforms()
+    
+    # Load test dataset
+    print("\nLoading test data...")
+    test_dataset = DiabeticRetinopathyYCbCrDataset(
+        csv_file=config['test_csv'],
+        img_dir=config['test_img_dir'],
+        transform=test_transforms
+    )
+    
+    # Create test data loader
+    test_loader = DataLoader(
+        test_dataset, 
+        batch_size=config['batch_size'], 
+        shuffle=False, 
+        num_workers=4,
+        pin_memory=True
+    )
+    
+    # Generate predictions
+    print(f"\nGenerating predictions with TTA: {config['use_tta']}")
+    predictions, image_names, probabilities = generate_predictions(
+        model, 
+        test_loader, 
+        use_tta=config['use_tta']
+    )
+    
+    # Create submission file
+    print("\nCreating submission file...")
+    submission_df = create_submission_file(
+        predictions, 
+        image_names, 
+        config['output_file']
+    )
+    
+    # Calculate confidence statistics
+    max_probs = np.max(probabilities, axis=1)
+    print(f"\nConfidence statistics:")
+    print(f"  Mean confidence: {np.mean(max_probs):.4f}")
+    print(f"  Std confidence: {np.std(max_probs):.4f}")
+    print(f"  Min confidence: {np.min(max_probs):.4f}")
+    print(f"  Max confidence: {np.max(max_probs):.4f}")
+    
+    # Show samples with lowest confidence
+    low_confidence_indices = np.argsort(max_probs)[:5]
+    print(f"\n5 predictions with lowest confidence:")
+    for i, idx in enumerate(low_confidence_indices):
+        print(f"  {i+1}. {image_names[idx]}: Class {predictions[idx]} (confidence: {max_probs[idx]:.4f})")
+    
+    print("\n" + "="*70)
+    print("YCbCr SE-RESNEXT26 INFERENCE COMPLETED SUCCESSFULLY!")
+    print("="*70)
+    print(f"Submission file: {config['output_file']}")
+    print(f"Total test images processed: {len(predictions)}")
+    print("="*70)
+    
+    return submission_df
+
+if __name__ == "__main__":
+    # Set random seeds for reproducibility
+    torch.manual_seed(42)
+    np.random.seed(42)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+    
+    # Run inference
+    submission_df = main()
