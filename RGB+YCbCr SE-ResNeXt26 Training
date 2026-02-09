@@ -1,0 +1,857 @@
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
+import torchvision.transforms as transforms
+from torchvision import models
+import pandas as pd
+import numpy as np
+import cv2
+from PIL import Image
+import os
+from sklearn.metrics import cohen_kappa_score, confusion_matrix, classification_report
+from sklearn.model_selection import train_test_split
+import matplotlib.pyplot as plt
+import seaborn as sns
+from tqdm import tqdm
+import warnings
+import json
+from datetime import datetime
+import random
+warnings.filterwarnings('ignore')
+
+# Set device
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+print(f"Using device: {device}")
+
+# Install timm if not available
+try:
+    import timm
+    print("timm is already installed")
+except ImportError:
+    print("Installing timm...")
+    import subprocess
+    subprocess.run(['pip', 'install', 'timm'])
+    import timm
+
+# Set random seeds for reproducibility
+torch.manual_seed(42)
+np.random.seed(42)
+random.seed(42)
+torch.backends.cudnn.deterministic = True
+torch.backends.cudnn.benchmark = False
+
+def crop_black_background(image, threshold=10):
+    """
+    Crop black background from retinal images
+    """
+    # Convert to grayscale for processing
+    if len(image.shape) == 3:
+        gray = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
+    else:
+        gray = image
+    
+    # Create mask for non-black pixels
+    mask = gray > threshold
+    
+    # Find bounding box of non-black region
+    coords = np.argwhere(mask)
+    if len(coords) == 0:
+        return image  # Return original if no non-black pixels found
+    
+    y0, x0 = coords.min(axis=0)
+    y1, x1 = coords.max(axis=0) + 1
+    
+    # Crop the image
+    cropped = image[y0:y1, x0:x1]
+    
+    return cropped
+
+def apply_perspective_transform(image, max_shift=0.1):
+    """
+    Apply random perspective transformation
+    """
+    h, w = image.shape[:2]
+    
+    # Random shift amount
+    shift_x = random.uniform(-max_shift, max_shift) * w
+    shift_y = random.uniform(-max_shift, max_shift) * h
+    
+    # Define source and destination points
+    src_points = np.float32([[0, 0], [w, 0], [w, h], [0, h]])
+    dst_points = np.float32([
+        [shift_x, shift_y],
+        [w - shift_x, shift_y],
+        [w - shift_x, h - shift_y],
+        [shift_x, h - shift_y]
+    ])
+    
+    # Get perspective transform matrix
+    matrix = cv2.getPerspectiveTransform(src_points, dst_points)
+    
+    # Apply transformation
+    transformed = cv2.warpPerspective(image, matrix, (w, h))
+    
+    return transformed
+
+class RetinaSpecificAugmentations:
+    """
+    Augmentations specifically designed for retinal images
+    """
+    def __init__(self, is_training=True):
+        self.is_training = is_training
+        
+    def __call__(self, image):
+        if not self.is_training:
+            return image
+            
+        if isinstance(image, Image.Image):
+            image = np.array(image)
+        
+        # Add vasculature-like augmentations
+        if random.random() < 0.4:
+            # Simulate different camera exposures
+            exposure_factor = random.uniform(0.8, 1.2)
+            image = cv2.convertScaleAbs(image, alpha=exposure_factor, beta=0)
+            
+        if random.random() < 0.3:
+            # Add slight blur to simulate focus issues
+            kernel_size = random.choice([3, 5])
+            image = cv2.GaussianBlur(image, (kernel_size, kernel_size), 0)
+            
+        if random.random() < 0.3:
+            # Add slight noise
+            noise = np.random.normal(0, 5, image.shape).astype(np.uint8)
+            image = cv2.add(image, noise)
+            
+        if random.random() < 0.4:
+            # Color channel adjustments (common in retinal photography)
+            for i in range(3):
+                adjustment = random.uniform(0.9, 1.1)
+                image[:, :, i] = np.clip(image[:, :, i] * adjustment, 0, 255).astype(np.uint8)
+                
+        return image
+
+class CustomAugmentations:
+    """
+    Custom augmentation pipeline
+    """
+    def __init__(self, is_training=True):
+        self.is_training = is_training
+        self.retina_augs = RetinaSpecificAugmentations(is_training)
+    
+    def __call__(self, image):
+        if not self.is_training:
+            return image
+        
+        # Convert PIL to numpy if needed
+        if isinstance(image, Image.Image):
+            image = np.array(image)
+        
+        # Apply augmentations with certain probabilities
+        if random.random() < 0.5:
+            # Horizontal flip
+            image = cv2.flip(image, 1)
+        
+        if random.random() < 0.5:
+            # Vertical flip
+            image = cv2.flip(image, 0)
+        
+        if random.random() < 0.7:
+            # Random rotation (0-360 degrees)
+            angle = random.uniform(0, 360)
+            h, w = image.shape[:2]
+            center = (w // 2, h // 2)
+            matrix = cv2.getRotationMatrix2D(center, angle, 1.0)
+            image = cv2.warpAffine(image, matrix, (w, h))
+        
+        if random.random() < 0.5:
+            # Zoom (1.0 to 1.35)
+            zoom_factor = random.uniform(1.0, 1.35)
+            h, w = image.shape[:2]
+            new_h, new_w = int(h * zoom_factor), int(w * zoom_factor)
+            
+            # Resize image
+            resized = cv2.resize(image, (new_w, new_h))
+            
+            # Crop or pad to original size
+            if zoom_factor > 1.0:
+                # Crop center
+                start_x = (new_w - w) // 2
+                start_y = (new_h - h) // 2
+                image = resized[start_y:start_y+h, start_x:start_x+w]
+            else:
+                # Pad
+                pad_x = (w - new_w) // 2
+                pad_y = (h - new_h) // 2
+                image = cv2.copyMakeBorder(resized, pad_y, pad_y, pad_x, pad_x, cv2.BORDER_CONSTANT)
+        
+        if random.random() < 0.3:
+            # Apply perspective transformation
+            image = apply_perspective_transform(image)
+        
+        # Apply retina-specific augmentations
+        image = self.retina_augs(image)
+        
+        return image
+
+class FocalLoss(nn.Module):
+    def __init__(self, alpha=None, gamma=2.0, reduction='mean'):
+        super(FocalLoss, self).__init__()
+        self.alpha = alpha
+        self.gamma = gamma
+        self.reduction = reduction
+        
+    def forward(self, inputs, targets):
+        ce_loss = F.cross_entropy(inputs, targets, reduction='none')
+        pt = torch.exp(-ce_loss)
+        focal_loss = (1 - pt) ** self.gamma * ce_loss
+        
+        if self.alpha is not None:
+            alpha_t = self.alpha[targets]
+            focal_loss = alpha_t * focal_loss
+            
+        if self.reduction == 'mean':
+            return focal_loss.mean()
+        elif self.reduction == 'sum':
+            return focal_loss.sum()
+        else:
+            return focal_loss
+
+class SEResNeXtBackbone(nn.Module):
+    """
+    SE-ResNeXt26 (26×4d) backbone wrapper for feature extraction
+    """
+    def __init__(self, model_name='seresnext26d_32x4d', pretrained=True):
+        super(SEResNeXtBackbone, self).__init__()
+        self.model = timm.create_model(model_name, pretrained=pretrained, num_classes=0)
+        self.feature_dim = self.model.num_features
+        
+    def forward(self, x):
+        return self.model(x)
+
+class EnhancedDualStreamFusionSEResNeXt(nn.Module):
+    """
+    Enhanced fusion with improved attention mechanism using SE-ResNeXt26 (26×4d) backbones
+    """
+    def __init__(self, num_classes=5, dropout_rate=0.5, model_name='seresnext26d_32x4d'):
+        super(EnhancedDualStreamFusionSEResNeXt, self).__init__()
+        
+        # RGB stream with SE-ResNeXt26
+        self.rgb_backbone = SEResNeXtBackbone(model_name=model_name, pretrained=True)
+        rgb_features = self.rgb_backbone.feature_dim
+        
+        # YCbCr stream with SE-ResNeXt26
+        self.ycbcr_backbone = SEResNeXtBackbone(model_name=model_name, pretrained=True)
+        ycbcr_features = self.ycbcr_backbone.feature_dim
+        
+        # Improved attention mechanism for feature fusion
+        self.attention = nn.Sequential(
+            nn.Linear(rgb_features + ycbcr_features, 512),
+            nn.ReLU(inplace=True),
+            nn.Dropout(dropout_rate),
+            nn.Linear(512, 256),
+            nn.ReLU(inplace=True),
+            nn.Dropout(dropout_rate/2),
+            nn.Linear(256, 2),
+            nn.Softmax(dim=1)
+        )
+        
+        # Final classifier with enhanced architecture
+        self.classifier = nn.Sequential(
+            nn.Dropout(dropout_rate),
+            nn.Linear(rgb_features + ycbcr_features, 1024),
+            nn.ReLU(inplace=True),
+            nn.BatchNorm1d(1024),
+            nn.Dropout(dropout_rate/2),
+            nn.Linear(1024, 512),
+            nn.ReLU(inplace=True),
+            nn.BatchNorm1d(512),
+            nn.Dropout(dropout_rate/2),
+            nn.Linear(512, num_classes)
+        )
+        
+        # Initialize weights for new layers
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight)
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0)
+        
+    def forward(self, x):
+        rgb, ycbcr = x
+        
+        rgb_features = self.rgb_backbone(rgb)
+        ycbcr_features = self.ycbcr_backbone(ycbcr)
+        
+        # Flatten features (SE-ResNeXt returns 4D tensor)
+        rgb_features = rgb_features.view(rgb_features.size(0), -1)
+        ycbcr_features = ycbcr_features.view(ycbcr_features.size(0), -1)
+        
+        # Concatenate features
+        combined = torch.cat([rgb_features, ycbcr_features], dim=1)
+        
+        # Calculate attention weights
+        attention_weights = self.attention(combined)
+        
+        # Apply attention with residual connection
+        weighted_rgb = attention_weights[:, 0:1] * rgb_features + rgb_features * 0.1
+        weighted_ycbcr = attention_weights[:, 1:2] * ycbcr_features + ycbcr_features * 0.1
+        
+        # Final fusion
+        fused_features = torch.cat([weighted_rgb, weighted_ycbcr], dim=1)
+        
+        return self.classifier(fused_features)
+
+class DiabeticRetinopathyRGBYCbCrDataset(Dataset):
+    """
+    Enhanced Dataset for Diabetic Retinopathy with RGB + YCbCr fusion
+    """
+    def __init__(self, csv_file, img_dir, transform=None, is_test=False, image_size=384):
+        """
+        Args:
+            csv_file (string): Path to csv with image names and labels
+            img_dir (string): Directory with all images
+            transform (callable, optional): Transform to be applied on images
+            is_test (bool): Whether this is test dataset (no labels)
+            image_size (int): Target image size (384x384)
+        """
+        self.data = pd.read_csv(csv_file)
+        self.img_dir = img_dir
+        self.transform = transform
+        self.is_test = is_test
+        self.image_size = image_size
+        
+        # Print dataset statistics
+        if not is_test:
+            print(f"Dataset loaded: {len(self.data)} images")
+            label_counts = self.data.iloc[:, 1].value_counts().sort_index()
+            print("Label distribution:")
+            for label, count in label_counts.items():
+                print(f"  Class {label}: {count} images ({count/len(self.data)*100:.1f}%)")
+        
+    def __len__(self):
+        return len(self.data)
+    
+    def preprocess_image(self, image_path):
+        """
+        Enhanced preprocessing with black background cropping
+        """
+        # Load image
+        image = cv2.imread(image_path)
+        if image is None:
+            raise ValueError(f"Could not load image: {image_path}")
+        
+        # Convert BGR to RGB
+        image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        
+        # Crop black background
+        image = crop_black_background(image, threshold=10)
+        
+        # Resize to target size
+        image = cv2.resize(image, (self.image_size, self.image_size))
+        
+        return image
+    
+    def rgb_to_ycbcr(self, rgb_image):
+        """
+        Convert RGB image to YCbCr with proper normalization
+        """
+        # Convert RGB to YCbCr using cv2
+        ycbcr_image = cv2.cvtColor(rgb_image, cv2.COLOR_RGB2YCrCb)
+        
+        # Normalize YCbCr channels properly
+        # Y channel: [16, 235] (for 8-bit), Cb/Cr: [16, 240]
+        ycbcr_image = ycbcr_image.astype(np.float32)
+        ycbcr_image[:, :, 0] = (ycbcr_image[:, :, 0] - 16) / (235 - 16)  # Y
+        ycbcr_image[:, :, 1] = (ycbcr_image[:, :, 1] - 16) / (240 - 16)  # Cb
+        ycbcr_image[:, :, 2] = (ycbcr_image[:, :, 2] - 16) / (240 - 16)  # Cr
+        
+        return ycbcr_image
+    
+    def __getitem__(self, idx):
+        if torch.is_tensor(idx):
+            idx = idx.tolist()
+            
+        # Get image name
+        img_name = self.data.iloc[idx, 0]
+        
+        # Try different extensions
+        img_extensions = ['.jpeg', '.jpg', '.png']
+        img_path = None
+        
+        for ext in img_extensions:
+            potential_path = os.path.join(self.img_dir, f"{img_name}{ext}")
+            if os.path.exists(potential_path):
+                img_path = potential_path
+                break
+                
+        if img_path is None:
+            raise FileNotFoundError(f"Image {img_name} not found with any extension")
+        
+        # Load and preprocess image
+        rgb_image = self.preprocess_image(img_path)
+        
+        # Convert to YCbCr with proper normalization
+        ycbcr_image = self.rgb_to_ycbcr(rgb_image)
+        
+        # Apply augmentations
+        if self.transform and hasattr(self.transform, '__call__'):
+            # Apply the same augmentation to both RGB and YCbCr
+            # Convert to PIL for consistent transformation
+            rgb_pil = Image.fromarray(rgb_image.astype(np.uint8))
+            ycbcr_pil = Image.fromarray((ycbcr_image * 255).astype(np.uint8))
+            
+            # Apply transforms
+            rgb_tensor = self.transform(rgb_pil)
+            ycbcr_tensor = self.transform(ycbcr_pil)
+        else:
+            # Convert to tensors without augmentation
+            rgb_tensor = torch.from_numpy(rgb_image.transpose(2, 0, 1)).float() / 255.0
+            ycbcr_tensor = torch.from_numpy(ycbcr_image.transpose(2, 0, 1)).float()
+            
+            # Normalize RGB with ImageNet stats
+            rgb_tensor = transforms.Normalize(
+                mean=[0.485, 0.456, 0.406], 
+                std=[0.229, 0.224, 0.225]
+            )(rgb_tensor)
+            
+            # YCbCr is already normalized to [0, 1] range
+        
+        # Return as tuple for dual-stream processing
+        if not self.is_test:
+            label = int(self.data.iloc[idx, 1])
+            return (rgb_tensor, ycbcr_tensor), label
+        else:
+            return (rgb_tensor, ycbcr_tensor), img_name
+
+class EnhancedTransforms:
+    """
+    Enhanced transforms with improved preprocessing for dual-stream architecture
+    """
+    def __init__(self, size=384, is_training=True):
+        self.size = size
+        self.is_training = is_training
+        
+        if is_training:
+            # Use custom augmentations
+            self.augmentation = CustomAugmentations(is_training=True)
+            
+            # Training transforms
+            self.transform = transforms.Compose([
+                transforms.RandomApply([
+                    transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.1)
+                ], p=0.8),
+                transforms.RandomApply([
+                    transforms.GaussianBlur(kernel_size=(3, 3), sigma=(0.1, 2.0))
+                ], p=0.3),
+                transforms.ToTensor(),
+            ])
+        else:
+            # No augmentation for validation/test
+            self.augmentation = CustomAugmentations(is_training=False)
+            self.transform = transforms.Compose([
+                transforms.ToTensor(),
+            ])
+    
+    def __call__(self, image):
+        """
+        Apply transforms to image
+        """
+        if isinstance(image, Image.Image):
+            image = np.array(image)
+        
+        # Apply custom augmentations
+        image = self.augmentation(image)
+        
+        # Convert back to PIL for standard transforms
+        image = Image.fromarray(image)
+        
+        # Apply standard transforms
+        image = self.transform(image)
+        
+        # Apply normalization (different for RGB and YCbCr)
+        if image.shape[0] == 3:  # RGB image
+            image = transforms.Normalize(
+                mean=[0.485, 0.456, 0.406], 
+                std=[0.229, 0.224, 0.225]
+            )(image)
+        # YCbCr is already normalized in the dataset
+        
+        return image
+
+def get_enhanced_transforms():
+    """
+    Get enhanced transforms for training and validation
+    """
+    train_transforms = EnhancedTransforms(size=384, is_training=True)
+    val_transforms = EnhancedTransforms(size=384, is_training=False)
+    
+    return train_transforms, val_transforms
+
+def quadratic_weighted_kappa(y_true, y_pred):
+    """
+    Calculate Quadratic Weighted Kappa (QWK) score
+    """
+    return cohen_kappa_score(y_true, y_pred, weights='quadratic')
+
+def get_optimizer_and_scheduler(model, train_loader, num_epochs, learning_rate):
+    # Separate parameters for differential learning rates
+    rgb_backbone_params = []
+    ycbcr_backbone_params = []
+    attention_params = []
+    classifier_params = []
+    
+    for name, param in model.named_parameters():
+        if 'rgb_backbone' in name:
+            rgb_backbone_params.append(param)
+        elif 'ycbcr_backbone' in name:
+            ycbcr_backbone_params.append(param)
+        elif 'attention' in name:
+            attention_params.append(param)
+        else:
+            classifier_params.append(param)
+    
+    optimizer = optim.AdamW([
+        {'params': rgb_backbone_params, 'lr': learning_rate * 0.1},
+        {'params': ycbcr_backbone_params, 'lr': learning_rate * 0.1},
+        {'params': attention_params, 'lr': learning_rate},
+        {'params': classifier_params, 'lr': learning_rate}
+    ], weight_decay=1e-4)
+    
+    # OneCycleLR scheduler
+    scheduler = optim.lr_scheduler.OneCycleLR(
+        optimizer, 
+        max_lr=learning_rate,
+        steps_per_epoch=len(train_loader),
+        epochs=num_epochs,
+        pct_start=0.3,
+        anneal_strategy='cos'
+    )
+    
+    return optimizer, scheduler
+
+def train_dual_stream_model(model, train_loader, val_loader, num_epochs=40, learning_rate=1e-4):
+    """
+    Train the dual-stream RGB+YCbCr fusion model with SE-ResNeXt
+    """
+    # Use Focal Loss for class imbalance
+    class_weights = torch.tensor([1.0, 2.5, 1.2, 4.0, 2.0]).to(device)
+    criterion = FocalLoss(alpha=class_weights, gamma=2.0)
+    
+    # Get enhanced optimizer and scheduler
+    optimizer, scheduler = get_optimizer_and_scheduler(model, train_loader, num_epochs, learning_rate)
+    
+    # Training history
+    history = {
+        'train_losses': [],
+        'val_losses': [],
+        'val_kappas': [],
+        'val_accuracies': [],
+        'learning_rates': []
+    }
+    
+    best_kappa = 0.0
+    best_model_state = None
+    patience_counter = 0
+    patience = 15
+    
+    print("Starting Enhanced Dual-Stream RGB+YCbCr Fusion Model Training with SE-ResNeXt26...")
+    print(f"Training on {len(train_loader.dataset)} samples")
+    print(f"Validating on {len(val_loader.dataset)} samples")
+    print(f"Image size: 384x384")
+    print(f"Architecture: Enhanced Dual-stream SE-ResNeXt26 (RGB + YCbCr)")
+    print(f"Total parameters: {sum(p.numel() for p in model.parameters()):,}")
+    
+    for epoch in range(num_epochs):
+        # Training phase
+        model.train()
+        train_loss = 0.0
+        train_correct = 0
+        train_total = 0
+        
+        train_pbar = tqdm(train_loader, desc=f'Epoch {epoch+1}/{num_epochs} [Train]')
+        
+        for batch_idx, (data, target) in enumerate(train_pbar):
+            # data is a tuple of (rgb_tensor, ycbcr_tensor)
+            rgb_data, ycbcr_data = data
+            rgb_data = rgb_data.to(device)
+            ycbcr_data = ycbcr_data.to(device)
+            target = target.to(device)
+            
+            # Skip batches with size 1 to avoid BatchNorm issues
+            if rgb_data.size(0) == 1:
+                continue
+            
+            optimizer.zero_grad()
+            output = model((rgb_data, ycbcr_data))
+            loss = criterion(output, target)
+            loss.backward()
+            
+            # Gradient clipping
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            
+            optimizer.step()
+            scheduler.step()
+            
+            train_loss += loss.item()
+            pred = output.argmax(dim=1, keepdim=True)
+            train_correct += pred.eq(target.view_as(pred)).sum().item()
+            train_total += target.size(0)
+            
+            # Update progress bar
+            current_acc = 100. * train_correct / train_total
+            train_pbar.set_postfix({
+                'Loss': f'{loss.item():.4f}',
+                'Acc': f'{current_acc:.2f}%',
+                'LR': f'{scheduler.get_last_lr()[0]:.2e}'
+            })
+        
+        avg_train_loss = train_loss / len(train_loader)
+        train_accuracy = 100. * train_correct / train_total
+        
+        # Validation phase
+        model.eval()
+        val_loss = 0.0
+        val_correct = 0
+        val_total = 0
+        all_preds = []
+        all_targets = []
+        
+        with torch.no_grad():
+            val_pbar = tqdm(val_loader, desc=f'Epoch {epoch+1}/{num_epochs} [Val]')
+            for data, target in val_pbar:
+                rgb_data, ycbcr_data = data
+                rgb_data = rgb_data.to(device)
+                ycbcr_data = ycbcr_data.to(device)
+                target = target.to(device)
+                
+                if rgb_data.size(0) == 1:
+                    continue
+                    
+                output = model((rgb_data, ycbcr_data))
+                loss = criterion(output, target)
+                val_loss += loss.item()
+                
+                pred = output.argmax(dim=1, keepdim=True)
+                val_correct += pred.eq(target.view_as(pred)).sum().item()
+                val_total += target.size(0)
+                
+                all_preds.extend(pred.cpu().numpy().flatten())
+                all_targets.extend(target.cpu().numpy())
+                
+                current_acc = 100. * val_correct / val_total
+                val_pbar.set_postfix({
+                    'Loss': f'{loss.item():.4f}',
+                    'Acc': f'{current_acc:.2f}%'
+                })
+        
+        avg_val_loss = val_loss / len(val_loader)
+        val_accuracy = 100. * val_correct / val_total
+        val_kappa = quadratic_weighted_kappa(all_targets, all_preds)
+        
+        current_lr = scheduler.get_last_lr()[0]
+        
+        # Store history
+        history['train_losses'].append(avg_train_loss)
+        history['val_losses'].append(avg_val_loss)
+        history['val_kappas'].append(val_kappa)
+        history['val_accuracies'].append(val_accuracy)
+        history['learning_rates'].append(current_lr)
+        
+        # Print epoch results
+        print(f'\nEpoch {epoch+1}/{num_epochs}:')
+        print(f'  Train Loss: {avg_train_loss:.4f} | Train Acc: {train_accuracy:.2f}%')
+        print(f'  Val Loss: {avg_val_loss:.4f} | Val Acc: {val_accuracy:.2f}%')
+        print(f'  Val QWK: {val_kappa:.4f}')
+        print(f'  Learning Rate: {current_lr:.8f}')
+        
+        # Save best model
+        if val_kappa > best_kappa:
+            best_kappa = val_kappa
+            best_model_state = model.state_dict().copy()
+            torch.save(best_model_state, 'best_dual_stream_seresnext_model.pth')
+            patience_counter = 0
+            print(f'  ✅ New best model saved! QWK: {best_kappa:.4f}')
+        else:
+            patience_counter += 1
+            
+        if patience_counter >= patience:
+            print(f'\nEarly stopping triggered after {patience} epochs without improvement.')
+            break
+            
+        print('-' * 70)
+    
+    # Load best model
+    if best_model_state is not None:
+        model.load_state_dict(best_model_state)
+    
+    history['best_kappa'] = best_kappa
+    history['total_epochs'] = epoch + 1
+    
+    return model, history
+
+def plot_training_history(history):
+    """
+    Plot comprehensive training history
+    """
+    fig, ((ax1, ax2), (ax3, ax4)) = plt.subplots(2, 2, figsize=(15, 12))
+    
+    # Plot losses
+    ax1.plot(history['train_losses'], label='Training Loss', color='blue')
+    ax1.plot(history['val_losses'], label='Validation Loss', color='orange')
+    ax1.set_title('SE-ResNeXt26 Dual-Stream Model: Training and Validation Loss')
+    ax1.set_xlabel('Epoch')
+    ax1.set_ylabel('Loss')
+    ax1.legend()
+    ax1.grid(True)
+    
+    # Plot QWK
+    ax2.plot(history['val_kappas'], label='Validation QWK', color='green', linewidth=2)
+    ax2.set_title('SE-ResNeXt26 Dual-Stream Model: Validation Quadratic Weighted Kappa')
+    ax2.set_xlabel('Epoch')
+    ax2.set_ylabel('QWK Score')
+    ax2.legend()
+    ax2.grid(True)
+    
+    # Plot accuracies
+    ax3.plot(history['val_accuracies'], label='Validation Accuracy', color='purple')
+    ax3.set_title('SE-ResNeXt26 Dual-Stream Model: Validation Accuracy')
+    ax3.set_xlabel('Epoch')
+    ax3.set_ylabel('Accuracy (%)')
+    ax3.legend()
+    ax3.grid(True)
+    
+    # Plot learning rate
+    ax4.plot(history['learning_rates'], label='Learning Rate', color='brown')
+    ax4.set_title('SE-ResNeXt26 Dual-Stream Model: Learning Rate Schedule')
+    ax4.set_xlabel('Epoch')
+    ax4.set_ylabel('Learning Rate')
+    ax4.set_yscale('log')
+    ax4.legend()
+    ax4.grid(True)
+    
+    plt.tight_layout()
+    plt.savefig('seresnext_dual_stream_training_history.png', dpi=300, bbox_inches='tight')
+    plt.show()
+
+def main():
+    """
+    Main training pipeline for dual-stream RGB+YCbCr fusion model with SE-ResNeXt26
+    """
+    # Configuration
+    config = {
+        'train_csv': '/kaggle/input/aptos2019-blindness-detection/train.csv',
+        'test_csv': '/kaggle/input/aptos2019-blindness-detection/test.csv',
+        'train_img_dir': '/kaggle/input/aptos2019-blindness-detection/train_images',
+        'test_img_dir': '/kaggle/input/aptos2019-blindness-detection/test_images',
+        'batch_size': 16,
+        'num_epochs': 40,
+        'learning_rate': 1e-4,
+        'num_classes': 5,
+        'dropout_rate': 0.5,
+        'image_size': 384,  # Increased to match the better-performing models
+        'model_name': 'seresnext26d_32x4d'
+    }
+    
+    print("="*70)
+    print("ENHANCED DUAL-STREAM DIABETIC RETINOPATHY RGB+YCbCr FUSION MODEL")
+    print("WITH SE-RESNEXT26 (26×4D) BACKBONE")
+    print("="*70)
+    print("Architecture Features:")
+    print("  - Dual-stream SE-ResNeXt26 (RGB + YCbCr)")
+    print("  - Improved attention-based feature fusion")
+    print("  - Proper YCbCr normalization")
+    print("  - Focal Loss for class imbalance")
+    print("  - OneCycleLR scheduler")
+    print("  - Retina-specific augmentations")
+    print("  - Black background cropping")
+    print("  - 384x384 input size")
+    print("="*70)
+    
+    # Get enhanced transforms
+    train_transforms, val_transforms = get_enhanced_transforms()
+    
+    # Load training data
+    print("\nLoading dual-stream RGB+YCbCr training data...")
+    full_train_dataset = DiabeticRetinopathyRGBYCbCrDataset(
+        csv_file=config['train_csv'],
+        img_dir=config['train_img_dir'],
+        transform=train_transforms,
+        image_size=config['image_size']
+    )
+    
+    # Split into train and validation
+    train_size = int(0.8 * len(full_train_dataset))
+    val_size = len(full_train_dataset) - train_size
+    train_dataset, val_dataset = torch.utils.data.random_split(
+        full_train_dataset, [train_size, val_size],
+        generator=torch.Generator().manual_seed(42)
+    )
+    
+    # Create data loaders
+    train_loader = DataLoader(
+        train_dataset, 
+        batch_size=config['batch_size'], 
+        shuffle=True, 
+        num_workers=4,
+        pin_memory=True,
+        drop_last=True
+    )
+    val_loader = DataLoader(
+        val_dataset, 
+        batch_size=config['batch_size'], 
+        shuffle=False, 
+        num_workers=4,
+        pin_memory=True,
+        drop_last=False
+    )
+    
+    # Initialize enhanced dual-stream model with SE-ResNeXt26
+    print("\nInitializing enhanced dual-stream RGB+YCbCr fusion model with SE-ResNeXt26...")
+    model = EnhancedDualStreamFusionSEResNeXt(
+        num_classes=config['num_classes'],
+        dropout_rate=config['dropout_rate'],
+        model_name=config['model_name']
+    )
+    model.to(device)
+    
+    # Train enhanced dual-stream model
+    print("\nStarting enhanced dual-stream RGB+YCbCr fusion model training with SE-ResNeXt26...")
+    model, history = train_dual_stream_model(
+        model, 
+        train_loader, 
+        val_loader, 
+        num_epochs=config['num_epochs'],
+        learning_rate=config['learning_rate']
+    )
+    
+    # Plot training history
+    plot_training_history(history)
+    
+    print(f"\nTraining completed!")
+    print(f"Best QWK: {history['best_kappa']:.4f}")
+    print(f"Total epochs: {history['total_epochs']}")
+    
+    # Save final results
+    results = {
+        'model': 'SE-ResNeXt26 Dual-Stream RGB+YCbCr',
+        'best_qwk': float(history['best_kappa']),
+        'total_epochs': int(history['total_epochs']),
+        'image_size': config['image_size'],
+        'batch_size': config['batch_size'],
+        'learning_rate': config['learning_rate'],
+        'architecture': 'Dual-stream with improved attention fusion',
+        'backbone': 'SE-ResNeXt26 (26×4d)',
+        'input_modalities': ['RGB', 'YCbCr']
+    }
+    
+    with open('seresnext_dual_stream_results.json', 'w') as f:
+        json.dump(results, f, indent=2)
+    
+    return model, history
+
+if __name__ == "__main__":
+    # Run enhanced dual-stream RGB+YCbCr fusion experiment with SE-ResNeXt26
+    model, history = main()
