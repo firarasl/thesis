@@ -1,0 +1,294 @@
+import torch
+import torch.nn as nn
+from torch.utils.data import Dataset, DataLoader
+import torchvision.transforms as transforms
+from torchvision import models
+import pandas as pd
+import numpy as np
+import cv2
+from PIL import Image
+import os
+from tqdm import tqdm
+import warnings
+warnings.filterwarnings('ignore')
+# Set device
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+print(f"Using device: {device}")
+class DiabeticRetinopathyRGBDataset(Dataset):
+    """
+    Custom Dataset for Diabetic Retinopathy with standard RGB images (Test Dataset)
+    """
+    def **init**(self, csv_file, img_dir, transform=None):
+        """
+        Args:
+            csv_file (string): Path to csv with image names
+            img_dir (string): Directory with all images
+            transform (callable, optional): Transform to be applied on images
+        """
+        self.data = pd.read_csv(csv_file)
+        self.img_dir = img_dir
+        self.transform = transform
+       
+        print(f"Test dataset loaded: {len(self.data)} images")
+       
+    def **len**(self):
+        return len(self.data)
+   
+    def **getitem**(self, idx):
+        if torch.is_tensor(idx):
+            idx = idx.tolist()
+           
+        # Get image name (assuming the CSV has 'id_code' column)
+        img_name = self.data.iloc[idx, 0] # First column should be image ID
+       
+        # Try different extensions
+        img_extensions = ['.png', '.jpg', '.jpeg']
+        img_path = None
+       
+        for ext in img_extensions:
+            potential_path = os.path.join(self.img_dir, f"{img_name}{ext}")
+            if os.path.exists(potential_path):
+                img_path = potential_path
+                break
+               
+        if img_path is None:
+            raise FileNotFoundError(f"Image {img_name} not found with any extension")
+       
+        # Load image in standard RGB format
+        image = cv2.imread(img_path)
+        if image is None:
+            raise ValueError(f"Could not load image: {img_path}")
+       
+        # Convert BGR (OpenCV default) to RGB
+        image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+       
+        # Convert to PIL Image for transforms
+        image = Image.fromarray(image)
+       
+        if self.transform:
+            image = self.transform(image)
+           
+        return image, img_name
+class DRRGBClassifier(nn.Module):
+    """
+    Diabetic Retinopathy Classifier using pretrained ResNet50 for RGB images
+    """
+    def **init**(self, num_classes=5, pretrained=False, dropout_rate=0.5):
+        super(DRRGBClassifier, self).**init**()
+       
+        # Use ResNet50 as backbone - set pretrained=False for inference
+        self.backbone = models.resnet50(pretrained=pretrained)
+       
+        # Store original fc layer input features
+        num_features = self.backbone.fc.in_features
+       
+        # Replace final layer with custom classifier
+        self.backbone.fc = nn.Sequential(
+            nn.Dropout(dropout_rate),
+            nn.Linear(num_features, 512),
+            nn.ReLU(inplace=True),
+            nn.Dropout(dropout_rate/2),
+            nn.Linear(512, num_classes)
+        )
+       
+    def forward(self, x):
+        return self.backbone(x)
+def get_test_transforms():
+    """
+    Define preprocessing transforms for test images (no augmentation)
+    """
+    test_transforms = transforms.Compose([
+        transforms.Resize((512, 512)),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+    ])
+   
+    return test_transforms
+def load_trained_model(model_path, num_classes=5, dropout_rate=0.5):
+    """
+    Load the pre-trained RGB model
+    """
+    print(f"Loading model from: {model_path}")
+   
+    # Initialize model architecture WITHOUT downloading pretrained weights
+    model = DRRGBClassifier(num_classes=num_classes, dropout_rate=dropout_rate, pretrained=False)
+   
+    # Load trained weights
+    checkpoint = torch.load(model_path, map_location=device)
+    model.load_state_dict(checkpoint)
+   
+    model.to(device)
+    model.eval()
+   
+    print("Model loaded successfully!")
+    return model
+def generate_predictions(model, test_loader, use_tta=False):
+    """
+    Generate predictions for test set
+   
+    Args:
+        model: Trained model
+        test_loader: DataLoader for test set
+        use_tta: Whether to use Test Time Augmentation (TTA)
+    """
+    model.eval()
+    predictions = []
+    image_names = []
+    all_probabilities = []
+   
+    print("Generating predictions...")
+   
+    with torch.no_grad():
+        for data, names in tqdm(test_loader, desc="Processing test images"):
+            data = data.to(device)
+           
+            if use_tta:
+                # Test Time Augmentation
+                outputs = model(data)
+               
+                # Horizontal flip
+                outputs += model(torch.flip(data, dims=[3]))
+               
+                # Vertical flip
+                outputs += model(torch.flip(data, dims=[2]))
+               
+                # Average the predictions
+                outputs = outputs / 3.0
+            else:
+                outputs = model(data)
+           
+            # Convert logits to probabilities
+            probs = torch.softmax(outputs, dim=1)
+           
+            # Get predicted classes
+            preds = probs.argmax(dim=1)
+           
+            predictions.extend(preds.cpu().numpy())
+            image_names.extend(names)
+            all_probabilities.extend(probs.cpu().numpy())
+   
+    return predictions, image_names, np.array(all_probabilities)
+def create_submission_file(predictions, image_names, output_file='submission.csv'):
+    """
+    Create submission file in Kaggle format
+    """
+    submission_df = pd.DataFrame({
+        'id_code': image_names,
+        'diagnosis': predictions
+    })
+   
+    # Sort by id_code to ensure consistent ordering
+    submission_df = submission_df.sort_values('id_code')
+   
+    # Save to CSV
+    submission_df.to_csv(output_file, index=False)
+   
+    print(f"Submission file saved: {output_file}")
+    print(f"Total predictions: {len(submission_df)}")
+   
+    # Print prediction distribution
+    print("\nPrediction distribution:")
+    label_names = ['No DR', 'Mild', 'Moderate', 'Severe', 'Proliferative']
+    for i, label in enumerate(label_names):
+        count = (submission_df['diagnosis'] == i).sum()
+        percentage = count / len(submission_df) * 100
+        print(f" Class {i} ({label}): {count} images ({percentage:.1f}%)")
+   
+    return submission_df
+def main():
+    """
+    Main inference pipeline
+    """
+    # Configuration
+    config = {
+        'model_path': '/kaggle/input/diabetic-retinopathy-rgb-model-experiment-2-2/best_rgb_model.pth',
+        'test_csv': '/kaggle/input/aptos2019-blindness-detection/test.csv',
+        'test_img_dir': '/kaggle/input/aptos2019-blindness-detection/test_images',
+        'batch_size': 32, # Increased batch size for inference
+        'num_classes': 5,
+        'dropout_rate': 0.5,
+        'use_tta': True, # Use Test Time Augmentation for better results
+        'output_file': 'submission.csv'
+    }
+   
+    print("="*70)
+    print("DIABETIC RETINOPATHY RGB MODEL - INFERENCE")
+    print("="*70)
+    print("Configuration:")
+    for key, value in config.items():
+        print(f" {key}: {value}")
+    print("="*70)
+   
+    # Check if test files exist
+    if not os.path.exists(config['test_csv']):
+        print(f"Error: Test CSV file not found at {config['test_csv']}")
+        return
+   
+    if not os.path.exists(config['test_img_dir']):
+        print(f"Error: Test images directory not found at {config['test_img_dir']}")
+        return
+   
+    if not os.path.exists(config['model_path']):
+        print(f"Error: Model file not found at {config['model_path']}")
+        return
+   
+    # Load trained model
+    model = load_trained_model(
+        config['model_path'],
+        config['num_classes'],
+        config['dropout_rate']
+    )
+   
+    # Get test transforms
+    test_transforms = get_test_transforms()
+   
+    # Load test dataset
+    print("\nLoading test data...")
+    test_dataset = DiabeticRetinopathyRGBDataset(
+        csv_file=config['test_csv'],
+        img_dir=config['test_img_dir'],
+        transform=test_transforms
+    )
+   
+    # Create test data loader
+    test_loader = DataLoader(
+        test_dataset,
+        batch_size=config['batch_size'],
+        shuffle=False,
+        num_workers=4,
+        pin_memory=True
+    )
+   
+    # Generate predictions
+    print(f"\nGenerating predictions with TTA: {config['use_tta']}")
+    predictions, image_names, probabilities = generate_predictions(
+        model,
+        test_loader,
+        use_tta=config['use_tta']
+    )
+   
+    # Create submission file
+    print("\nCreating submission file...")
+    submission_df = create_submission_file(
+        predictions,
+        image_names,
+        config['output_file']
+    )
+   
+    print("\n" + "="*70)
+    print("INFERENCE COMPLETED SUCCESSFULLY!")
+    print("="*70)
+    print(f"Submission file: {config['output_file']}")
+    print(f"Total test images processed: {len(predictions)}")
+    print("="*70)
+   
+    return submission_df
+if **name** == "**main**":
+    # Set random seeds for reproducibility
+    torch.manual_seed(42)
+    np.random.seed(42)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+   
+    # Run inference
+    submission_df = main()
