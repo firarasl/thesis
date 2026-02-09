@@ -1,0 +1,435 @@
+
+import torch
+import torch.nn as nn
+from torch.utils.data import Dataset, DataLoader
+import torchvision.transforms as transforms
+import pandas as pd
+import numpy as np
+import cv2
+from PIL import Image
+import os
+from tqdm import tqdm
+import warnings
+import json
+warnings.filterwarnings('ignore')
+
+# Set device
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+print(f"Using device: {device}")
+
+# Install timm for Swin Transformer if not already installed
+try:
+    import timm
+    print("timm is already installed")
+except ImportError:
+    print("Installing timm...")
+    import subprocess
+    subprocess.run(['pip', 'install', 'timm'])
+    import timm
+
+class DiabeticRetinopathyGBDataset(Dataset):
+    """
+    Custom Dataset for Diabetic Retinopathy with GB (Green-Blue) channels only (Test Dataset)
+    """
+    def __init__(self, csv_file, img_dir, transform=None):
+        """
+        Args:
+            csv_file (string): Path to csv with image names
+            img_dir (string): Directory with all images
+            transform (callable, optional): Transform to be applied on images
+        """
+        self.data = pd.read_csv(csv_file)
+        self.img_dir = img_dir
+        self.transform = transform
+        
+        print(f"GB Test dataset loaded: {len(self.data)} images")
+        
+    def __len__(self):
+        return len(self.data)
+    
+    def __getitem__(self, idx):
+        if torch.is_tensor(idx):
+            idx = idx.tolist()
+            
+        # Get image name
+        img_name = str(self.data.iloc[idx, 0])  # First column should be image ID
+        
+        # Try different extensions
+        img_extensions = ['.png', '.jpg', '.jpeg']
+        img_path = None
+        
+        for ext in img_extensions:
+            potential_path = os.path.join(self.img_dir, f"{img_name}{ext}")
+            if os.path.exists(potential_path):
+                img_path = potential_path
+                break
+                
+        if img_path is None:
+            raise FileNotFoundError(f"Image {img_name} not found with any extension")
+        
+        # Load image and extract GB channels
+        image = cv2.imread(img_path)
+        if image is None:
+            raise ValueError(f"Could not load image: {img_path}")
+        
+        # Convert BGR (OpenCV default) to RGB
+        image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        
+        # Extract Green and Blue channels only
+        image_gb = np.zeros((image_rgb.shape[0], image_rgb.shape[1], 2), dtype=np.uint8)
+        image_gb[:, :, 0] = image_rgb[:, :, 1]  # Green channel
+        image_gb[:, :, 1] = image_rgb[:, :, 2]  # Blue channel
+        
+        # Convert to PIL Image for transforms
+        image_pil = Image.fromarray(image_gb)
+        
+        if self.transform:
+            image_tensor = self.transform(image_pil)
+        else:
+            # Default conversion if no transform
+            image_tensor = torch.from_numpy(image_gb).permute(2, 0, 1).float() / 255.0
+            
+        return image_tensor, img_name
+
+class GBSwinTransformerClassifier(nn.Module):
+    """
+    Diabetic Retinopathy Classifier for GB (Green-Blue) channels using Swin Transformer
+    """
+    def __init__(self, num_classes=5, model_name='swin_base_patch4_window7_224', pretrained=False, dropout_rate=0.5):
+        super(GBSwinTransformerClassifier, self).__init__()
+        
+        # Use Swin Transformer as backbone
+        self.backbone = timm.create_model(
+            model_name, 
+            pretrained=pretrained, 
+            num_classes=0,  # Remove classification head
+            in_chans=2      # GB has 2 channels
+        )
+        
+        # Get feature dimension
+        num_features = self.backbone.num_features
+        
+        # Custom classifier head
+        self.classifier = nn.Sequential(
+            nn.LayerNorm(num_features),
+            nn.Dropout(dropout_rate),
+            nn.Linear(num_features, 512),
+            nn.GELU(),
+            nn.Dropout(dropout_rate/2),
+            nn.Linear(512, 256),
+            nn.GELU(),
+            nn.Dropout(dropout_rate/4),
+            nn.Linear(256, num_classes)
+        )
+        
+    def forward(self, x):
+        features = self.backbone(x)
+        return self.classifier(features)
+
+def get_gb_test_transforms(gb_mean, gb_std):
+    """
+    Define preprocessing transforms for GB test images (no augmentation)
+    Uses 224x224 resolution for Swin Transformer with GB-specific normalization
+    """
+    test_transforms = transforms.Compose([
+        transforms.Resize((224, 224)),  # Swin Transformer uses 224x224
+        transforms.ToTensor(),
+        transforms.Normalize(mean=gb_mean, std=gb_std)
+    ])
+    
+    return test_transforms
+
+def load_gb_normalization_stats(stats_path='gb_swin_normalization_stats.json'):
+    """
+    Load GB normalization statistics from training
+    """
+    if not os.path.exists(stats_path):
+        print(f"Warning: Normalization stats file not found at {stats_path}")
+        print("Using default GB normalization")
+        return [0.5, 0.5], [0.5, 0.5]
+    
+    with open(stats_path, 'r') as f:
+        stats = json.load(f)
+    
+    gb_mean = stats['gb_mean']
+    gb_std = stats['gb_std']
+    
+    print(f"Loaded GB normalization: mean={gb_mean}, std={gb_std}")
+    return gb_mean, gb_std
+
+def load_trained_gb_model(model_path, num_classes=5, dropout_rate=0.5):
+    """
+    Load the pre-trained GB Swin Transformer model with safe loading
+    """
+    print(f"Loading GB Swin Transformer model from: {model_path}")
+    
+    # Initialize model architecture WITHOUT downloading pretrained weights
+    model = GBSwinTransformerClassifier(
+        num_classes=num_classes, 
+        model_name='swin_base_patch4_window7_224',
+        dropout_rate=dropout_rate, 
+        pretrained=False
+    )
+    
+    # Load trained weights with safe handling for PyTorch 2.6+
+    try:
+        # First try with weights_only=True (safe mode)
+        if torch.cuda.is_available():
+            checkpoint = torch.load(model_path, map_location=device, weights_only=True)
+        else:
+            checkpoint = torch.load(model_path, map_location='cpu', weights_only=True)
+        print("Model loaded safely with weights_only=True")
+    except:
+        print("Safe loading failed, trying with weights_only=False (ensure you trust this source)")
+        if torch.cuda.is_available():
+            checkpoint = torch.load(model_path, map_location=device, weights_only=False)
+        else:
+            checkpoint = torch.load(model_path, map_location='cpu', weights_only=False)
+        print("Model loaded with weights_only=False")
+    
+    # Handle different checkpoint formats
+    if 'model_state_dict' in checkpoint:
+        model.load_state_dict(checkpoint['model_state_dict'])
+        print(f"Loaded model from epoch {checkpoint.get('epoch', 'unknown')}")
+        print(f"Best QWK during training: {checkpoint.get('best_kappa', 'unknown')}")
+    else:
+        model.load_state_dict(checkpoint)
+    
+    model.to(device)
+    model.eval()
+    
+    print("GB Swin Transformer model loaded successfully!")
+    return model
+
+def generate_gb_predictions(model, test_loader, use_tta=False):
+    """
+    Generate predictions for test set using GB model
+    
+    Args:
+        model: Trained GB model
+        test_loader: DataLoader for test set
+        use_tta: Whether to use Test Time Augmentation (TTA)
+    """
+    model.eval()
+    predictions = []
+    image_names = []
+    all_probabilities = []
+    
+    print("Generating GB channel predictions...")
+    
+    with torch.no_grad():
+        for data, names in tqdm(test_loader, desc="Processing GB test images"):
+            data = data.to(device)
+            
+            if use_tta:
+                # Test Time Augmentation for GB channels
+                outputs = model(data)
+                
+                # Horizontal flip
+                outputs += model(torch.flip(data, dims=[3]))
+                
+                # Vertical flip
+                outputs += model(torch.flip(data, dims=[2]))
+                
+                # Average the predictions
+                outputs = outputs / 3.0
+            else:
+                outputs = model(data)
+            
+            # Convert logits to probabilities
+            probs = torch.softmax(outputs, dim=1)
+            
+            # Get predicted classes
+            preds = probs.argmax(dim=1)
+            
+            predictions.extend(preds.cpu().numpy())
+            image_names.extend(names)
+            all_probabilities.extend(probs.cpu().numpy())
+    
+    return predictions, image_names, np.array(all_probabilities)
+
+def create_submission_file(predictions, image_names, output_file='gb_swin_submission.csv'):
+    """
+    Create submission file in Kaggle format
+    """
+    submission_df = pd.DataFrame({
+        'id_code': image_names,
+        'diagnosis': predictions
+    })
+    
+    # Sort by id_code to ensure consistent ordering
+    submission_df = submission_df.sort_values('id_code')
+    
+    # Save to CSV
+    submission_df.to_csv(output_file, index=False)
+    
+    print(f"GB Swin Transformer submission file saved: {output_file}")
+    print(f"Total predictions: {len(submission_df)}")
+    
+    # Print prediction distribution
+    print("\nGB Model Prediction distribution:")
+    label_names = ['No DR', 'Mild', 'Moderate', 'Severe', 'Proliferative']
+    for i, label in enumerate(label_names):
+        count = (submission_df['diagnosis'] == i).sum()
+        percentage = count / len(submission_df) * 100
+        print(f"  Class {i} ({label}): {count} images ({percentage:.1f}%)")
+    
+    return submission_df
+
+def main():
+    """
+    Main inference pipeline for GB Swin Transformer model
+    """
+    # Configuration - UPDATE THESE PATHS FOR YOUR KAGGLE NOTEBOOK
+    config = {
+        'model_path': '/kaggle/input/gb-swin-training/best_gb_swin_model.pth',  # Update with your GB model path
+        'normalization_stats_path': '/kaggle/input/gb-swin-training/gb_swin_normalization_stats.json',  # Update path
+        'test_csv': '/kaggle/input/aptos2019-blindness-detection/test.csv',
+        'test_img_dir': '/kaggle/input/aptos2019-blindness-detection/test_images',
+        'batch_size': 16,  # Batch size for inference
+        'num_classes': 5,
+        'dropout_rate': 0.5,
+        'use_tta': True,  # Use Test Time Augmentation for better results
+        'output_file': 'submission.csv'
+    }
+    
+    # Alternative path configurations for common Kaggle setups
+    possible_model_paths = [
+        config['model_path'],
+        '/kaggle/input/gb-swin-model/best_gb_swin_model.pth',
+        '/kaggle/working/best_gb_swin_model.pth',
+        'best_gb_swin_model.pth'
+    ]
+    
+    possible_stats_paths = [
+        config['normalization_stats_path'],
+        '/kaggle/input/gb-swin-model/gb_swin_normalization_stats.json',
+        '/kaggle/working/gb_swin_normalization_stats.json',
+        'gb_swin_normalization_stats.json'
+    ]
+    
+    # Find existing model file
+    model_found = False
+    for model_path in possible_model_paths:
+        if os.path.exists(model_path):
+            config['model_path'] = model_path
+            model_found = True
+            break
+    
+    if not model_found:
+        print("Error: No GB model file found in common locations.")
+        print("Please update the model_path in the config dictionary.")
+        return
+    
+    # Find existing stats file
+    stats_found = False
+    for stats_path in possible_stats_paths:
+        if os.path.exists(stats_path):
+            config['normalization_stats_path'] = stats_path
+            stats_found = True
+            break
+    
+    if not stats_found:
+        print("Warning: No normalization stats file found, using defaults")
+        config['normalization_stats_path'] = None
+    
+    print("="*70)
+    print("DIABETIC RETINOPATHY GB SWIN TRANSFORMER MODEL - INFERENCE")
+    print("="*70)
+    print("Configuration:")
+    for key, value in config.items():
+        print(f"  {key}: {value}")
+    print("="*70)
+    
+    # Check if test files exist
+    if not os.path.exists(config['test_csv']):
+        print(f"Error: Test CSV file not found at {config['test_csv']}")
+        return
+    
+    if not os.path.exists(config['test_img_dir']):
+        print(f"Error: Test images directory not found at {config['test_img_dir']}")
+        return
+    
+    if not os.path.exists(config['model_path']):
+        print(f"Error: GB model file not found at {config['model_path']}")
+        print("Please make sure the model file exists or update the model_path in the config.")
+        return
+    
+    # Load GB normalization statistics
+    if config['normalization_stats_path'] and os.path.exists(config['normalization_stats_path']):
+        gb_mean, gb_std = load_gb_normalization_stats(config['normalization_stats_path'])
+    else:
+        print("Using default GB normalization statistics")
+        gb_mean, gb_std = [0.5, 0.5], [0.5, 0.5]
+    
+    # Load trained GB model
+    model = load_trained_gb_model(
+        config['model_path'], 
+        config['num_classes'], 
+        config['dropout_rate']
+    )
+    
+    # Get GB test transforms with proper normalization
+    test_transforms = get_gb_test_transforms(gb_mean, gb_std)
+    
+    # Load test dataset for GB channels
+    print("\nLoading GB test data...")
+    test_dataset = DiabeticRetinopathyGBDataset(
+        csv_file=config['test_csv'],
+        img_dir=config['test_img_dir'],
+        transform=test_transforms
+    )
+    
+    # Create test data loader
+    test_loader = DataLoader(
+        test_dataset, 
+        batch_size=config['batch_size'], 
+        shuffle=False, 
+        num_workers=2,  # Reduced for stability
+        pin_memory=True
+    )
+    
+    # Generate predictions using GB channels
+    print(f"\nGenerating GB channel predictions with TTA: {config['use_tta']}")
+    predictions, image_names, probabilities = generate_gb_predictions(
+        model, 
+        test_loader, 
+        use_tta=config['use_tta']
+    )
+    
+    # Create submission file
+    print("\nCreating GB Swin Transformer submission file...")
+    submission_df = create_submission_file(
+        predictions, 
+        image_names, 
+        config['output_file']
+    )
+    
+    # Save prediction probabilities for analysis
+    prob_df = pd.DataFrame(probabilities, columns=[f'class_{i}' for i in range(5)])
+    prob_df['id_code'] = image_names
+    prob_df['prediction'] = predictions
+    prob_df.to_csv('gb_swin_prediction_probabilities.csv', index=False)
+    print("Prediction probabilities saved to 'gb_swin_prediction_probabilities.csv'")
+    
+    print("\n" + "="*70)
+    print("GB SWIN TRANSFORMER INFERENCE COMPLETED SUCCESSFULLY!")
+    print("="*70)
+    print(f"Submission file: {config['output_file']}")
+    print(f"Total test images processed: {len(predictions)}")
+    print(f"Model used: GB (Green-Blue) Channel Swin Transformer")
+    print(f"TTA used: {config['use_tta']}")
+    print(f"GB Normalization: mean={gb_mean}, std={gb_std}")
+    print("="*70)
+    
+    return submission_df
+
+if __name__ == "__main__":
+    # Set random seeds for reproducibility
+    torch.manual_seed(42)
+    np.random.seed(42)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+    
+    # Run inference
+    submission_df = main()
