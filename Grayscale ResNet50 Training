@@ -1,0 +1,442 @@
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader
+import torchvision.transforms as transforms
+from torchvision import models
+import pandas as pd
+import numpy as np
+import cv2
+from PIL import Image
+import os
+from sklearn.metrics import cohen_kappa_score
+from sklearn.model_selection import train_test_split
+import matplotlib.pyplot as plt
+from tqdm import tqdm
+from torchvision.models import resnet50
+import warnings
+warnings.filterwarnings('ignore')
+# Set device
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+print(f"Using device: {device}")
+class DiabeticRetinopathyDataset(Dataset):
+    """
+    Custom Dataset for Diabetic Retinopathy with Grayscale conversion
+    """
+    def **init**(self, csv_file, img_dir, transform=None, is_test=False):
+        """
+        Args:
+            csv_file (string): Path to csv with image names and labels
+            img_dir (string): Directory with all images
+            transform (callable, optional): Transform to be applied on images
+            is_test (bool): Whether this is test dataset (no labels)
+        """
+        self.data = pd.read_csv(csv_file)
+        self.img_dir = img_dir
+        self.transform = transform
+        self.is_test = is_test
+       
+    def **len**(self):
+        return len<a href="http://self.data" target="_blank" rel="noopener noreferrer nofollow"></a>
+   
+    def **getitem**(self, idx):
+        if torch.is_tensor(idx):
+            idx = idx.tolist()
+           
+        # Get image name
+        img_name = self.data.iloc[idx, 0] # Assuming first column is image name
+       
+        # Try different extensions
+        img_extensions = ['.jpeg', '.jpg', '.png']
+        img_path = None
+       
+        for ext in img_extensions:
+            potential_path = os.path.join(self.img_dir, f"{img_name}{ext}")
+            if os.path.exists(potential_path):
+                img_path = potential_path
+                break
+               
+        if img_path is None:
+            raise FileNotFoundError(f"Image {img_name} not found with any extension")
+       
+        # Load and convert image to grayscale
+        image = cv2.imread(img_path)
+        if image is None:
+            raise ValueError(f"Could not load image: {img_path}")
+       
+        # Convert BGR to RGB first, then to grayscale using proper weights
+        image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+       
+        # Convert to grayscale using luminance formula: 0.299*R + 0.587*G + 0.114*B
+        grayscale = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
+       
+        # Convert back to 3-channel for consistency with pretrained models
+        grayscale_3ch = cv2.cvtColor(grayscale, cv2.COLOR_GRAY2RGB)
+       
+        # Convert to PIL Image for transforms
+        image = Image.fromarray(grayscale_3ch)
+       
+        if self.transform:
+            image = self.transform(image)
+           
+        if not self.is_test:
+            label = int(self.data.iloc[idx, 1]) # Assuming second column is label
+            return image, label
+        else:
+            return image, img_name
+class DRClassifier(nn.Module):
+    """
+    Diabetic Retinopathy Classifier using pretrained ResNet50
+    Modified for grayscale input (though we use 3-channel grayscale)
+    """
+    def **init**(self, num_classes=5, pretrained=True):
+        super(DRClassifier, self).**init**()
+       
+        # Use ResNet50 as backbone
+        self.backbone = models.resnet50(pretrained=pretrained)
+       
+        # Modify the final layer for DR classification (5 classes: 0-4)
+        num_features = self.backbone.fc.in_features
+        self.backbone.fc = nn.Linear(num_features, num_classes)
+       
+        # Add dropout for regularization
+        self.dropout = nn.Dropout(0.5)
+       
+    def forward(self, x):
+        # Extract features using backbone (excluding final fc layer)
+        x = self.backbone.conv1(x)
+        x = self.backbone.bn1(x)
+        x = self.backbone.relu(x)
+        x = self.backbone.maxpool(x)
+       
+        x = self.backbone.layer1(x)
+        x = self.backbone.layer2(x)
+        x = self.backbone.layer3(x)
+        x = self.backbone.layer4(x)
+       
+        x = self.backbone.avgpool(x)
+        x = torch.flatten(x, 1)
+        x = self.dropout(x)
+        x = self.backbone.fc(x)
+       
+        return x
+def get_transforms():
+    """
+    Define data augmentation and preprocessing transforms
+    """
+    train_transforms = transforms.Compose([
+        transforms.Resize((512, 512)),
+        transforms.RandomHorizontalFlip(p=0.5),
+        transforms.RandomVerticalFlip(p=0.5),
+        transforms.RandomRotation(degrees=10),
+        transforms.ColorJitter(brightness=0.2, contrast=0.2),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+    ])
+   
+    val_transforms = transforms.Compose([
+        transforms.Resize((512, 512)),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+    ])
+   
+    return train_transforms, val_transforms
+def quadratic_weighted_kappa(y_true, y_pred):
+    """
+    Calculate Quadratic Weighted Kappa (QWK) score
+    """
+    return cohen_kappa_score(y_true, y_pred, weights='quadratic')
+def train_model(model, train_loader, val_loader, num_epochs=50, learning_rate=1e-4):
+    """
+    Train the diabetic retinopathy model
+    """
+    # Loss function and optimizer
+    criterion = nn.CrossEntropyLoss()
+    optimizer = optim.Adam(model.parameters(), lr=learning_rate, weight_decay=1e-4)
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', factor=0.5, patience=5, verbose=True)
+   
+    # Training history
+    train_losses = []
+    val_losses = []
+    val_kappas = []
+    best_kappa = 0.0
+    best_model_state = None
+   
+    print("Starting training...")
+    print(f"Training on {len(train_loader.dataset)} samples")
+    print(f"Validating on {len(val_loader.dataset)} samples")
+   
+    for epoch in range(num_epochs):
+        # Training phase
+        model.train()
+        train_loss = 0.0
+        train_pbar = tqdm(train_loader, desc=f'Epoch {epoch+1}/{num_epochs} [Train]')
+       
+        for batch_idx, (data, target) in enumerate(train_pbar):
+            data, target = data.to(device), target.to(device)
+           
+            optimizer.zero_grad()
+            output = model(data)
+            loss = criterion(output, target)
+            loss.backward()
+            optimizer.step()
+           
+            train_loss += loss.item()
+            train_pbar.set_postfix({'Loss': f'{loss.item():.4f}'})
+       
+        avg_train_loss = train_loss / len(train_loader)
+        train_losses.append(avg_train_loss)
+       
+        # Validation phase
+        model.eval()
+        val_loss = 0.0
+        all_preds = []
+        all_targets = []
+       
+        with torch.no_grad():
+            val_pbar = tqdm(val_loader, desc=f'Epoch {epoch+1}/{num_epochs} [Val]')
+            for data, target in val_pbar:
+                data, target = data.to(device), target.to(device)
+                output = model(data)
+                loss = criterion(output, target)
+                val_loss += loss.item()
+               
+                # Get predictions
+                pred = output.argmax(dim=1, keepdim=True)
+                all_preds.extend(pred.cpu().numpy().flatten())
+                all_targets.extend(target.cpu().numpy())
+               
+                val_pbar.set_postfix({'Loss': f'{loss.item():.4f}'})
+       
+        avg_val_loss = val_loss / len(val_loader)
+        val_losses.append(avg_val_loss)
+       
+        # Calculate QWK
+        val_kappa = quadratic_weighted_kappa(all_targets, all_preds)
+        val_kappas.append(val_kappa)
+       
+        # Update learning rate
+        scheduler.step(val_kappa)
+       
+        print(f'Epoch {epoch+1}/{num_epochs}:')
+        print(f' Train Loss: {avg_train_loss:.4f}')
+        print(f' Val Loss: {avg_val_loss:.4f}')
+        print(f' Val QWK: {val_kappa:.4f}')
+        print(f' Current LR: {optimizer.param_groups[0]["lr"]:.6f}')
+       
+        # Save best model
+        if val_kappa > best_kappa:
+            best_kappa = val_kappa
+            best_model_state = model.state_dict().copy()
+            torch.save(best_model_state, 'best_grayscale_model.pth')
+            print(f' New best model saved! QWK: {best_kappa:.4f}')
+       
+        print('-' * 50)
+   
+    # Load best model
+    model.load_state_dict(best_model_state)
+   
+    return model, {
+        'train_losses': train_losses,
+        'val_losses': val_losses,
+        'val_kappas': val_kappas,
+        'best_kappa': best_kappa
+    }
+def evaluate_model(model, test_loader, save_predictions=True):
+    """
+    Evaluate model on test set and generate predictions
+    """
+    model.eval()
+    predictions = []
+    image_names = []
+   
+    print("Generating predictions...")
+    with torch.no*grad():
+        for data, names in tqdm(test_loader):
+            data = data.to(device)
+            outputs = model(data)
+            preds = outputs.argmax(dim=1)
+           
+            predictions.extend(preds.cpu().numpy())
+            image_names.extend(names)
+   
+    if save_predictions:
+        # Create submission file
+        submission_df = pd.DataFrame({
+            'id_code': image_names,
+            'diagnosis': predictions
+        })
+        submission*df.to_csv('grayscale_predictions.csv', index=False)
+        print("Predictions saved to 'grayscale_predictions.csv'")
+   
+    return predictions, image_names
+def plot_training_history(history):
+    """
+    Plot training history
+    """
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 5))
+   
+    # Plot losses
+    ax1.plot(history['train_losses'], label='Training Loss')
+    ax1.plot(history['val_losses'], label='Validation Loss')
+    ax1.set_title('Training and Validation Loss')
+    ax1.set_xlabel('Epoch')
+    ax1.set_ylabel('Loss')
+    ax1.legend()
+    ax1.grid(True)
+   
+    # Plot QWK
+    ax2.plot(history['val_kappas'], label='Validation QWK', color='green')
+    ax2.axhline(y=0.889, color='red', linestyle='--', label='Target QWK (0.889)')
+    ax2.set_title('Validation Quadratic Weighted Kappa')
+    ax2.set_xlabel('Epoch')
+    ax2.set_ylabel('QWK Score')
+    ax2.legend()
+    ax2.grid(True)
+   
+    plt.tight_layout()
+    plt.savefig('grayscale_training_history.png', dpi=300, bbox_inches='tight')
+    plt.show()
+   
+    print(f"Best QWK Score: {history['best_kappa']:.4f}")
+    if history['best_kappa'] > 0.889:
+        print("✅ Target QWK score (>0.889) achieved!")
+    else:
+        print("❌ Target QWK score (>0.889) not yet achieved.")
+def main():
+    """
+    Main training pipeline for grayscale DR classification
+    """
+    # Configuration
+    config = {
+        'train_csv': '/kaggle/input/aptos2019-blindness-detection/train.csv', # Update with your train CSV path
+        'test_csv': '/kaggle/input/aptos2019-blindness-detection/test.csv', # Update with your test CSV path
+        'train_img_dir': '/kaggle/input/aptos2019-blindness-detection/train_images', # Update with your train images directory
+        'test_img_dir': '/kaggle/input/aptos2019-blindness-detection/test_images', # Update with your test images directory
+        'batch_size': 16,
+        'num_epochs': 50,
+        'learning_rate': 1e-4,
+        'num_classes': 5
+    }
+   
+    print("="*60)
+    print("DIABETIC RETINOPATHY GRAYSCALE MODEL - EXPERIMENT 2.1")
+    print("="*60)
+    print(f"Configuration:")
+    for key, value in config.items():
+        print(f" {key}: {value}")
+    print("="*60)
+   
+    # Get transforms
+    train_transforms, val_transforms = get_transforms()
+   
+    # Load training data and split
+    print("Loading training data...")
+    full_train_dataset = DiabeticRetinopathyDataset(
+        csv_file=config['train_csv'],
+        img_dir=config['train_img_dir'],
+        transform=train_transforms
+    )
+   
+    # Split into train and validation
+    train_size = int(0.8 * len(full_train_dataset))
+    val_size = len(full_train_dataset) - train_size
+    train_dataset, val_dataset = torch.utils.data.random_split(
+        full_train_dataset, [train_size, val_size]
+    )
+   
+    # Update validation dataset transform
+    val_dataset.dataset.transform = val_transforms
+   
+    # Create data loaders
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=config['batch_size'],
+        shuffle=True,
+        num_workers=4
+    )
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=config['batch_size'],
+        shuffle=False,
+        num_workers=4
+    )
+   
+    # Load test data
+    test_dataset = DiabeticRetinopathyDataset(
+        csv_file=config['test_csv'],
+        img_dir=config['test_img_dir'],
+        transform=val_transforms,
+        is_test=True
+    )
+    test_loader = DataLoader(
+        test_dataset,
+        batch_size=config['batch_size'],
+        shuffle=False,
+        num_workers=4
+    )
+   
+    # Initialize model
+    print("Initializing model...")
+    model = DRClassifier(num_classes=config['num_classes'])
+    model.to(device)
+   
+    # Print model summary
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"Total parameters: {total_params:,}")
+    print(f"Trainable parameters: {trainable_params:,}")
+   
+    # Train model
+    model, history = train_model(
+        model,
+        train_loader,
+        val_loader,
+        num_epochs=config['num_epochs'],
+        learning_rate=config['learning_rate']
+    )
+   
+    # Plot training history
+    plot_training_history(history)
+   
+    # Generate test predictions
+    print("\nGenerating test predictions...")
+    predictions, image_names = evaluate_model(model, test_loader)
+   
+    # Save final results
+    results = {
+        'experiment': 'Grayscale Model (2.1)',
+        'best_qwk': history['best_kappa'],
+        'total_epochs': config['num_epochs'],
+        'final_lr': 'adaptive',
+        'model_architecture': 'ResNet50',
+        'input_type': 'Grayscale (converted to 3-channel)',
+        'preprocessing': 'RGB→Grayscale using luminance weights (0.299*R + 0.587*G + 0.114*B)'
+    }
+   
+    print("\n" + "="*60)
+    print("EXPERIMENT 2.1 RESULTS SUMMARY")
+    print("="*60)
+    for key, value in results.items():
+        print(f"{key}: {value}")
+    print("="*60)
+   
+    # Save results to file
+    with open('grayscale_experiment_results.txt', 'w') as f:
+        f.write("DIABETIC RETINOPATHY GRAYSCALE MODEL - EXPERIMENT 2.1\n")
+        f.write("="*60 + "\n")
+        for key, value in results.items():
+            f.write(f"{key}: {value}\n")
+        f.write("="*60 + "\n")
+   
+    print("Results saved to 'grayscale_experiment_results.txt'")
+    print("Model saved as 'best_grayscale_model.pth'")
+    print("Predictions saved as 'grayscale_predictions.csv'")
+   
+    return model, history, results
+if **name** == "**main**":
+    # Set random seeds for reproducibility
+    torch.manual_seed(42)
+    np.random.seed(42)
+   
+    # Run main training pipeline
+    model, history, results = main() and this is submission for grayscale import torch
