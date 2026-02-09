@@ -1,0 +1,404 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
+import torchvision.transforms as transforms
+from torchvision import models
+import pandas as pd
+import numpy as np
+import cv2
+from PIL import Image
+import os
+from tqdm import tqdm
+import warnings
+warnings.filterwarnings('ignore')
+
+# Set device
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+print(f"Using device: {device}")
+
+def crop_black_background(image, threshold=10):
+    """
+    Crop black background from retinal images
+    """
+    # Convert to grayscale for processing
+    if len(image.shape) == 3:
+        gray = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
+    else:
+        gray = image
+    
+    # Create mask for non-black pixels
+    mask = gray > threshold
+    
+    # Find bounding box of non-black region
+    coords = np.argwhere(mask)
+    if len(coords) == 0:
+        return image  # Return original if no non-black pixels found
+    
+    y0, x0 = coords.min(axis=0)
+    y1, x1 = coords.max(axis=0) + 1
+    
+    # Crop the image
+    cropped = image[y0:y1, x0:x1]
+    
+    return cropped
+
+class DiabeticRetinopathyRGBYCbCrTestDataset(Dataset):
+    """
+    Test Dataset for Diabetic Retinopathy with RGB + YCbCr fusion
+    """
+    def __init__(self, csv_file, img_dir, transform=None, image_size=384):
+        """
+        Args:
+            csv_file (string): Path to csv with image names
+            img_dir (string): Directory with all images
+            transform (callable, optional): Transform to be applied on images
+            image_size (int): Target image size (384x384)
+        """
+        self.data = pd.read_csv(csv_file)
+        self.img_dir = img_dir
+        self.transform = transform
+        self.image_size = image_size
+        
+        print(f"Test dataset loaded: {len(self.data)} images")
+        
+    def __len__(self):
+        return len(self.data)
+    
+    def preprocess_image(self, image_path):
+        """
+        Enhanced preprocessing with black background cropping
+        """
+        # Load image
+        image = cv2.imread(image_path)
+        if image is None:
+            raise ValueError(f"Could not load image: {image_path}")
+        
+        # Convert BGR to RGB
+        image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        
+        # Crop black background
+        image = crop_black_background(image, threshold=10)
+        
+        # Resize to target size
+        image = cv2.resize(image, (self.image_size, self.image_size))
+        
+        return image
+    
+    def rgb_to_ycbcr_tensor(self, rgb_image):
+        """
+        Convert RGB image to YCbCr
+        """
+        # Convert RGB to YCbCr using cv2
+        ycbcr_image = cv2.cvtColor(rgb_image, cv2.COLOR_RGB2YCrCb)
+        return ycbcr_image
+    
+    def __getitem__(self, idx):
+        if torch.is_tensor(idx):
+            idx = idx.tolist()
+            
+        # Get image name
+        img_name = self.data.iloc[idx, 0]
+        
+        # Try different extensions
+        img_extensions = ['.png', '.jpg', '.jpeg']
+        img_path = None
+        
+        for ext in img_extensions:
+            potential_path = os.path.join(self.img_dir, f"{img_name}{ext}")
+            if os.path.exists(potential_path):
+                img_path = potential_path
+                break
+                
+        if img_path is None:
+            raise FileNotFoundError(f"Image {img_name} not found with any extension")
+        
+        # Load and preprocess image
+        rgb_image = self.preprocess_image(img_path)
+        
+        # Convert to YCbCr
+        ycbcr_image = self.rgb_to_ycbcr_tensor(rgb_image)
+        
+        # Apply transforms if provided
+        if self.transform:
+            # Convert to PIL for transforms
+            rgb_pil = Image.fromarray(rgb_image)
+            ycbcr_pil = Image.fromarray(ycbcr_image)
+            
+            # Apply transforms
+            rgb_tensor = self.transform(rgb_pil)
+            ycbcr_tensor = self.transform(ycbcr_pil)
+            
+            return (rgb_tensor, ycbcr_tensor), img_name
+        else:
+            # Convert to tensors manually
+            rgb_tensor = torch.from_numpy(rgb_image.transpose(2, 0, 1)).float() / 255.0
+            ycbcr_tensor = torch.from_numpy(ycbcr_image.transpose(2, 0, 1)).float() / 255.0
+            
+            # Normalize with ImageNet stats
+            rgb_tensor = transforms.Normalize(
+                mean=[0.485, 0.456, 0.406], 
+                std=[0.229, 0.224, 0.225]
+            )(rgb_tensor)
+            
+            ycbcr_tensor = transforms.Normalize(
+                mean=[0.485, 0.456, 0.406], 
+                std=[0.229, 0.224, 0.225]
+            )(ycbcr_tensor)
+            
+            return (rgb_tensor, ycbcr_tensor), img_name
+
+class DualStreamRGBYCbCrFusion(nn.Module):
+    """
+    Dual-stream architecture that preserves ImageNet weights for both RGB and YCbCr streams
+    """
+    def __init__(self, num_classes=5, dropout_rate=0.5):
+        super(DualStreamRGBYCbCrFusion, self).__init__()
+        
+        # RGB stream - keeps original ImageNet weights
+        self.rgb_backbone = models.resnet50(pretrained=False)
+        rgb_features = self.rgb_backbone.fc.in_features
+        self.rgb_backbone.fc = nn.Identity()  # Remove final FC layer
+        
+        # YCbCr stream - separate ResNet50 for YCbCr
+        self.ycbcr_backbone = models.resnet50(pretrained=False)
+        ycbcr_features = self.ycbcr_backbone.fc.in_features
+        self.ycbcr_backbone.fc = nn.Identity()  # Remove final FC layer
+        
+        # Fusion layer
+        combined_features = rgb_features + ycbcr_features  # 2048 + 2048 = 4096
+        
+        # Final classifier with enhanced regularization
+        self.classifier = nn.Sequential(
+            nn.Dropout(dropout_rate),
+            nn.Linear(combined_features, 1024),
+            nn.ReLU(inplace=True),
+            nn.Dropout(dropout_rate/2),
+            nn.Linear(1024, 512),
+            nn.ReLU(inplace=True),
+            nn.Dropout(dropout_rate/2),
+            nn.Linear(512, num_classes)
+        )
+        
+        # Initialize new layers
+        for m in self.classifier.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight)
+                nn.init.constant_(m.bias, 0)
+    
+    def forward(self, x):
+        # x is a tuple of (rgb_tensor, ycbcr_tensor)
+        rgb, ycbcr = x
+        
+        # Extract features from both streams
+        rgb_features = self.rgb_backbone(rgb)
+        ycbcr_features = self.ycbcr_backbone(ycbcr)
+        
+        # Concatenate features
+        combined_features = torch.cat([rgb_features, ycbcr_features], dim=1)
+        
+        # Final classification
+        output = self.classifier(combined_features)
+        
+        return output
+
+def get_test_transforms():
+    """
+    Get test transforms (no augmentation)
+    """
+    return transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Normalize(
+            mean=[0.485, 0.456, 0.406], 
+            std=[0.229, 0.224, 0.225]
+        )
+    ])
+
+def load_model(model_path, num_classes=5, dropout_rate=0.5):
+    """
+    Load the trained dual-stream model
+    """
+    print(f"Loading model from: {model_path}")
+    
+    # Initialize model
+    model = DualStreamRGBYCbCrFusion(
+        num_classes=num_classes,
+        dropout_rate=dropout_rate
+    )
+    
+    # Load state dict
+    try:
+        state_dict = torch.load(model_path, map_location=device)
+        model.load_state_dict(state_dict)
+        print("✅ Model loaded successfully!")
+    except Exception as e:
+        print(f"❌ Error loading model: {e}")
+        return None
+    
+    model.to(device)
+    model.eval()
+    
+    return model
+
+def predict_test_dataset(model, test_loader, use_tta=True):
+    """
+    Generate predictions for test dataset
+    """
+    model.eval()
+    predictions = []
+    image_names = []
+    
+    print("\nGenerating predictions...")
+    
+    with torch.no_grad():
+        for batch_idx, (data, names) in enumerate(tqdm(test_loader, desc="Predicting")):
+            rgb_data, ycbcr_data = data
+            rgb_data = rgb_data.to(device)
+            ycbcr_data = ycbcr_data.to(device)
+            
+            if use_tta:
+                # Test Time Augmentation (TTA)
+                # Original
+                outputs = model((rgb_data, ycbcr_data))
+                
+                # Horizontal flip
+                rgb_flipped = torch.flip(rgb_data, dims=[3])
+                ycbcr_flipped = torch.flip(ycbcr_data, dims=[3])
+                outputs_h = model((rgb_flipped, ycbcr_flipped))
+                
+                # Vertical flip
+                rgb_vflipped = torch.flip(rgb_data, dims=[2])
+                ycbcr_vflipped = torch.flip(ycbcr_data, dims=[2])
+                outputs_v = model((rgb_vflipped, ycbcr_vflipped))
+                
+                # Both flips
+                rgb_both = torch.flip(torch.flip(rgb_data, dims=[3]), dims=[2])
+                ycbcr_both = torch.flip(torch.flip(ycbcr_data, dims=[3]), dims=[2])
+                outputs_both = model((rgb_both, ycbcr_both))
+                
+                # Average predictions
+                outputs = (outputs + outputs_h + outputs_v + outputs_both) / 4.0
+            else:
+                outputs = model((rgb_data, ycbcr_data))
+            
+            # Get probabilities
+            probs = F.softmax(outputs, dim=1)
+            
+            # Get predicted classes
+            preds = outputs.argmax(dim=1)
+            
+            predictions.extend(preds.cpu().numpy())
+            image_names.extend(names)
+    
+    return predictions, image_names
+
+def create_submission(predictions, image_names, output_path='submission.csv'):
+    """
+    Create submission file
+    """
+    submission_df = pd.DataFrame({
+        'id_code': image_names,
+        'diagnosis': predictions
+    })
+    
+    # Sort by id_code to match expected format
+    submission_df = submission_df.sort_values('id_code').reset_index(drop=True)
+    
+    # Save submission
+    submission_df.to_csv(output_path, index=False)
+    print(f"\n✅ Submission saved to: {output_path}")
+    
+    # Display prediction distribution
+    print("\nPrediction Distribution:")
+    pred_counts = submission_df['diagnosis'].value_counts().sort_index()
+    for class_idx, count in pred_counts.items():
+        percentage = (count / len(submission_df)) * 100
+        print(f"  Class {class_idx}: {count:4d} samples ({percentage:5.1f}%)")
+    
+    return submission_df
+
+def main():
+    """
+    Main inference pipeline
+    """
+    # Configuration
+    config = {
+        'model_path': '/kaggle/input/rgb-ycbcr-6-channel/best_dual_stream_model.pth',
+        'test_csv': '/kaggle/input/aptos2019-blindness-detection/test.csv',
+        'test_img_dir': '/kaggle/input/aptos2019-blindness-detection/test_images',
+        'batch_size': 32,
+        'num_classes': 5,
+        'dropout_rate': 0.5,
+        'image_size': 384,
+        'use_tta': True,  # Test Time Augmentation
+        'output_path': 'submission.csv'
+    }
+    
+    print("="*70)
+    print("DUAL-STREAM DIABETIC RETINOPATHY INFERENCE")
+    print("="*70)
+    print("Model Features:")
+    print("  - Dual-stream ResNet50 (RGB + YCbCr)")
+    print("  - Feature-level fusion")
+    print("  - Black background cropping")
+    print("  - Test Time Augmentation (TTA)")
+    print("="*70)
+    
+    # Load model
+    model = load_model(
+        config['model_path'],
+        num_classes=config['num_classes'],
+        dropout_rate=config['dropout_rate']
+    )
+    
+    if model is None:
+        print("❌ Failed to load model. Exiting.")
+        return
+    
+    # Get test transforms
+    test_transforms = get_test_transforms()
+    
+    # Load test dataset
+    print(f"\nLoading test dataset...")
+    test_dataset = DiabeticRetinopathyRGBYCbCrTestDataset(
+        csv_file=config['test_csv'],
+        img_dir=config['test_img_dir'],
+        transform=test_transforms,
+        image_size=config['image_size']
+    )
+    
+    # Create test loader
+    test_loader = DataLoader(
+        test_dataset,
+        batch_size=config['batch_size'],
+        shuffle=False,
+        num_workers=4,
+        pin_memory=True
+    )
+    
+    # Generate predictions
+    predictions, image_names = predict_test_dataset(
+        model, 
+        test_loader, 
+        use_tta=config['use_tta']
+    )
+    
+    # Create submission file
+    submission_df = create_submission(
+        predictions, 
+        image_names, 
+        config['output_path']
+    )
+    
+    print(f"\n✅ Inference completed successfully!")
+    print(f"📊 Generated predictions for {len(predictions)} images")
+    print(f"💾 Submission file: {config['output_path']}")
+    
+    # Display first few predictions
+    print("\nFirst 10 predictions:")
+    print(submission_df.head(10))
+    
+    return submission_df
+
+if __name__ == "__main__":
+    submission_df = main()
