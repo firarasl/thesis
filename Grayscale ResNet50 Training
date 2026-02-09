@@ -299,9 +299,9 @@ def plot_training_history(history):
    
     print(f"Best QWK Score: {history['best_kappa']:.4f}")
     if history['best_kappa'] > 0.889:
-        print("✅ Target QWK score (>0.889) achieved!")
+        print("Target QWK score (>0.889) achieved!")
     else:
-        print("❌ Target QWK score (>0.889) not yet achieved.")
+        print("Target QWK score (>0.889) not yet achieved.")
 def main():
     """
     Main training pipeline for grayscale DR classification
@@ -439,4 +439,4 @@ if **name** == "**main**":
     np.random.seed(42)
    
     # Run main training pipeline
-    model, history, results = main() and this is submission for grayscale import torch
+    model, history, results = main() 
