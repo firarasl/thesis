@@ -1,0 +1,449 @@
+import torch
+import torch.nn as nn
+from torch.utils.data import Dataset, DataLoader
+import torchvision.transforms as transforms
+import pandas as pd
+import numpy as np
+import cv2
+from PIL import Image
+import os
+from tqdm import tqdm
+import warnings
+warnings.filterwarnings('ignore')
+
+# Set device
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+print(f"Using device: {device}")
+
+# Install timm if not available
+try:
+    import timm
+    print("timm is already installed")
+except ImportError:
+    print("Installing timm...")
+    import subprocess
+    subprocess.run(['pip', 'install', 'timm'])
+    import timm
+
+# ==================== DATASET CLASSES ====================
+
+def crop_black_background(image, threshold=10):
+    """Crop black background from retinal images"""
+    if len(image.shape) == 3:
+        gray = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
+    else:
+        gray = image
+    
+    mask = gray > threshold
+    coords = np.argwhere(mask)
+    if len(coords) == 0:
+        return image
+    
+    y0, x0 = coords.min(axis=0)
+    y1, x1 = coords.max(axis=0) + 1
+    return image[y0:y1, x0:x1]
+
+class EnsembleDataset(Dataset):
+    """Dataset that handles all preprocessing for different model types"""
+    def __init__(self, csv_file, img_dir, image_size=384):
+        self.data = pd.read_csv(csv_file)
+        self.img_dir = img_dir
+        self.image_size = image_size
+        print(f"Test dataset loaded: {len(self.data)} images")
+        
+    def __len__(self):
+        return len(self.data)
+    
+    def preprocess_image(self, image_path, crop_black=True):
+        """Load and preprocess image"""
+        image = cv2.imread(image_path)
+        if image is None:
+            raise ValueError(f"Could not load image: {image_path}")
+        
+        image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        
+        if crop_black:
+            image = crop_black_background(image, threshold=10)
+        
+        image = cv2.resize(image, (self.image_size, self.image_size))
+        return image
+    
+    def rgb_to_ycbcr(self, rgb_image):
+        """Convert RGB to YCbCr"""
+        ycbcr_array = cv2.cvtColor(rgb_image, cv2.COLOR_RGB2YCrCb)
+        y_channel = ycbcr_array[:, :, 0]
+        cr_channel = ycbcr_array[:, :, 1]
+        cb_channel = ycbcr_array[:, :, 2]
+        ycbcr_correct = np.stack([y_channel, cb_channel, cr_channel], axis=2)
+        return ycbcr_correct
+    
+    def rgb_to_hsv(self, rgb_image):
+        """Convert RGB to HSV"""
+        return cv2.cvtColor(rgb_image, cv2.COLOR_RGB2HSV)
+    
+    def __getitem__(self, idx):
+        img_name = self.data.iloc[idx, 0]
+        
+        # Try different extensions
+        img_extensions = ['.png', '.jpg', '.jpeg']
+        img_path = None
+        
+        for ext in img_extensions:
+            potential_path = os.path.join(self.img_dir, f"{img_name}{ext}")
+            if os.path.exists(potential_path):
+                img_path = potential_path
+                break
+                
+        if img_path is None:
+            raise FileNotFoundError(f"Image {img_name} not found with any extension")
+        
+        # Load and preprocess base RGB image
+        rgb_image = self.preprocess_image(img_path, crop_black=True)
+        
+        # Convert to other color spaces
+        ycbcr_image = self.rgb_to_ycbcr(rgb_image)
+        hsv_image = self.rgb_to_hsv(rgb_image)
+        
+        # Convert to PIL Images for transforms
+        rgb_pil = Image.fromarray(rgb_image)
+        ycbcr_pil = Image.fromarray(ycbcr_image)
+        hsv_pil = Image.fromarray(hsv_image)
+        
+        return {
+            'rgb': rgb_pil,
+            'ycbcr': ycbcr_pil,
+            'hsv': hsv_pil,
+            'name': img_name
+        }
+
+# ==================== MODEL DEFINITIONS ====================
+
+class DRYCbCrPVT2Classifier(nn.Module):
+    def __init__(self, num_classes=5, pretrained=False, dropout_rate=0.5):
+        super(DRYCbCrPVT2Classifier, self).__init__()
+        self.backbone = timm.create_model('pvt_v2_b2', pretrained=pretrained, num_classes=0, in_chans=3)
+        self.num_features = self.backbone.num_features
+        self.classifier = nn.Sequential(
+            nn.Linear(self.num_features, 512),
+            nn.ReLU(inplace=True),
+            nn.Dropout(dropout_rate),
+            nn.Linear(512, num_classes)
+        )
+        
+    def forward(self, x):
+        features = self.backbone(x)
+        return self.classifier(features)
+
+class SwinTransformerClassifier(nn.Module):
+    def __init__(self, num_classes=5, dropout_rate=0.5):
+        super(SwinTransformerClassifier, self).__init__()
+        self.backbone = timm.create_model('swin_base_patch4_window7_224', pretrained=False, num_classes=0)
+        num_features = self.backbone.num_features
+        self.classifier = nn.Sequential(
+            nn.LayerNorm(num_features),
+            nn.Dropout(dropout_rate),
+            nn.Linear(num_features, 512),
+            nn.GELU(),
+            nn.Dropout(dropout_rate/2),
+            nn.Linear(512, num_classes)
+        )
+        
+    def forward(self, x):
+        features = self.backbone(x)
+        return self.classifier(features)
+
+class PVTv2Backbone(nn.Module):
+    def __init__(self, model_name='pvt_v2_b2', pretrained=False):
+        super(PVTv2Backbone, self).__init__()
+        self.model = timm.create_model(model_name, pretrained=pretrained, num_classes=0)
+        self.feature_dim = self.model.num_features
+        
+    def forward(self, x):
+        return self.model(x)
+
+class DualStreamPVTv2Fusion(nn.Module):
+    def __init__(self, num_classes=5, dropout_rate=0.5):
+        super(DualStreamPVTv2Fusion, self).__init__()
+        self.rgb_backbone = PVTv2Backbone(pretrained=False)
+        self.hsv_backbone = PVTv2Backbone(pretrained=False)
+        combined_features = 512 * 2  # PVTv2-b2 feature dimension
+        
+        self.classifier = nn.Sequential(
+            nn.Dropout(dropout_rate),
+            nn.Linear(combined_features, 1024),
+            nn.ReLU(inplace=True),
+            nn.Dropout(dropout_rate/2),
+            nn.Linear(1024, 512),
+            nn.ReLU(inplace=True),
+            nn.Dropout(dropout_rate/2),
+            nn.Linear(512, num_classes)
+        )
+        
+    def forward(self, rgb, hsv):
+        rgb_features = self.rgb_backbone(rgb)
+        hsv_features = self.hsv_backbone(hsv)
+        combined_features = torch.cat([rgb_features, hsv_features], dim=1)
+        return self.classifier(combined_features)
+
+class EnhancedDualStreamFusionPVT(nn.Module):
+    def __init__(self, num_classes=5, dropout_rate=0.5):
+        super(EnhancedDualStreamFusionPVT, self).__init__()
+        
+        # RGB stream with PVTv2
+        self.rgb_backbone = PVTv2Backbone(model_name='pvt_v2_b2', pretrained=False)
+        
+        # YCbCr stream with PVTv2
+        self.ycbcr_backbone = PVTv2Backbone(model_name='pvt_v2_b2', pretrained=False)
+        
+        # Get feature dimensions from PVTv2-b2
+        rgb_features = 512  # PVTv2-b2 feature dimension
+        ycbcr_features = 512
+        
+        # Attention mechanism for feature fusion
+        self.attention = nn.Sequential(
+            nn.Linear(rgb_features + ycbcr_features, 256),
+            nn.ReLU(inplace=True),
+            nn.Dropout(dropout_rate),
+            nn.Linear(256, 2),
+            nn.Softmax(dim=1)
+        )
+        
+        # Final classifier - MATCHING THE ORIGINAL TRAINING ARCHITECTURE
+        self.classifier = nn.Sequential(
+            nn.Dropout(dropout_rate),
+            nn.Linear(rgb_features + ycbcr_features, 1024),
+            nn.ReLU(inplace=True),
+            nn.BatchNorm1d(1024),
+            nn.Dropout(dropout_rate/2),
+            nn.Linear(1024, 512),
+            nn.ReLU(inplace=True),
+            nn.BatchNorm1d(512),
+            nn.Dropout(dropout_rate/2),
+            nn.Linear(512, num_classes)
+        )
+        
+    def forward(self, rgb, ycbcr):
+        rgb_features = self.rgb_backbone(rgb)
+        ycbcr_features = self.ycbcr_backbone(ycbcr)
+        
+        # Concatenate features
+        combined = torch.cat([rgb_features, ycbcr_features], dim=1)
+        
+        # Calculate attention weights
+        attention_weights = self.attention(combined)
+        
+        # Apply attention
+        weighted_rgb = attention_weights[:, 0:1] * rgb_features
+        weighted_ycbcr = attention_weights[:, 1:2] * ycbcr_features
+        
+        # Final fusion
+        fused_features = torch.cat([weighted_rgb, weighted_ycbcr], dim=1)
+        
+        return self.classifier(fused_features)
+
+# ==================== TRANSFORMS ====================
+
+def get_ycbcr_transforms():
+    ycbcr_mean = [0.5, 0.5, 0.5]
+    ycbcr_std = [0.25, 0.25, 0.25]
+    return transforms.Compose([
+        transforms.Resize((512, 512)),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=ycbcr_mean, std=ycbcr_std)
+    ])
+
+def get_swin_transforms():
+    return transforms.Compose([
+        transforms.Resize((224, 224)),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+    ])
+
+def get_pvt_transforms():
+    return transforms.Compose([
+        transforms.Resize((384, 384)),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+    ])
+
+# ==================== ENSEMBLE INFERENCE ====================
+
+def load_all_models(config):
+    """Load all four trained models"""
+    models = {}
+    
+    # 1. YCbCr PVT2 Model
+    print("Loading YCbCr PVT2 model...")
+    model1 = DRYCbCrPVT2Classifier(num_classes=5, pretrained=False)
+    checkpoint = torch.load(config['model_paths']['ycbcr_pvt2'], map_location=device)
+    if 'state_dict' in checkpoint:
+        model1.load_state_dict(checkpoint['state_dict'])
+    else:
+        model1.load_state_dict(checkpoint)
+    model1.to(device).eval()
+    models['ycbcr_pvt2'] = model1
+    
+    # 2. RGB Swin Transformer
+    print("Loading RGB Swin Transformer model...")
+    model2 = SwinTransformerClassifier(num_classes=5)
+    checkpoint = torch.load(config['model_paths']['rgb_swin'], map_location=device)
+    model2.load_state_dict(checkpoint)
+    model2.to(device).eval()
+    models['rgb_swin'] = model2
+    
+    # 3. RGB+HSV PVT2 Model
+    print("Loading RGB+HSV PVT2 model...")
+    model3 = DualStreamPVTv2Fusion(num_classes=5)
+    checkpoint = torch.load(config['model_paths']['rgb_hsv_pvt2'], map_location=device)
+    model3.load_state_dict(checkpoint)
+    model3.to(device).eval()
+    models['rgb_hsv_pvt2'] = model3
+    
+    # 4. RGB+YCbCr PVT2 Model - FIXED ARCHITECTURE
+    print("Loading RGB+YCbCr PVT2 model...")
+    model4 = EnhancedDualStreamFusionPVT(num_classes=5)
+    checkpoint = torch.load(config['model_paths']['rgb_ycbcr_pvt2'], map_location=device)
+    model4.load_state_dict(checkpoint)
+    model4.to(device).eval()
+    models['rgb_ycbcr_pvt2'] = model4
+    
+    return models
+
+def ensemble_predict(models, batch_data, transforms_dict):
+    """Generate predictions from all models for a batch"""
+    all_probs = []
+    
+    # Apply appropriate transforms and get predictions from each model
+    with torch.no_grad():
+        # 1. YCbCr PVT2 Model (needs YCbCr input)
+        ycbcr_tensor = transforms_dict['ycbcr'](batch_data['ycbcr']).unsqueeze(0).to(device)
+        probs1 = torch.softmax(models['ycbcr_pvt2'](ycbcr_tensor), dim=1)
+        all_probs.append(probs1.cpu().numpy())
+        
+        # 2. RGB Swin Transformer (needs RGB input, 224x224)
+        rgb_swin_tensor = transforms_dict['swin'](batch_data['rgb']).unsqueeze(0).to(device)
+        probs2 = torch.softmax(models['rgb_swin'](rgb_swin_tensor), dim=1)
+        all_probs.append(probs2.cpu().numpy())
+        
+        # 3. RGB+HSV PVT2 Model (needs both RGB and HSV inputs, 384x384)
+        rgb_pvt_tensor = transforms_dict['pvt'](batch_data['rgb']).unsqueeze(0).to(device)
+        hsv_pvt_tensor = transforms_dict['pvt'](batch_data['hsv']).unsqueeze(0).to(device)
+        probs3 = torch.softmax(models['rgb_hsv_pvt2'](rgb_pvt_tensor, hsv_pvt_tensor), dim=1)
+        all_probs.append(probs3.cpu().numpy())
+        
+        # 4. RGB+YCbCr PVT2 Model (needs both RGB and YCbCr inputs, 384x384)
+        rgb_pvt_tensor2 = transforms_dict['pvt'](batch_data['rgb']).unsqueeze(0).to(device)
+        ycbcr_pvt_tensor = transforms_dict['pvt'](batch_data['ycbcr']).unsqueeze(0).to(device)
+        probs4 = torch.softmax(models['rgb_ycbcr_pvt2'](rgb_pvt_tensor2, ycbcr_pvt_tensor), dim=1)
+        all_probs.append(probs4.cpu().numpy())
+    
+    return np.array(all_probs)
+
+def main():
+    """Main ensemble inference pipeline"""
+    # Configuration
+    config = {
+        'model_paths': {
+            'ycbcr_pvt2': '/kaggle/input/ycbcr-dr-final-pvt2-training/best_ycbcr_pvt2_model.pth',
+            'rgb_swin': '/kaggle/input/rgb-swin-final-transformer-for-ensemble/pytorch/default/1/best_swin_model_for_ensemble.pth',
+            'rgb_hsv_pvt2': '/kaggle/input/rgb-hsv-final-with-pvtv2/best_dual_stream_pvtv2_model.pth',
+            'rgb_ycbcr_pvt2': '/kaggle/input/rgb-ycbcr-final-pvtv2-training/best_dual_stream_pvt_model.pth'
+        },
+        'test_csv': '/kaggle/input/aptos2019-blindness-detection/test.csv',
+        'test_img_dir': '/kaggle/input/aptos2019-blindness-detection/test_images',
+        'output_file': 'submission.csv',
+        'weights': [0.4, 0.3, 0.2, 0.1]  # Weighted by performance: 0.91, 0.90, 0.89, 0.89
+    }
+    
+    print("="*70)
+    print("ENSEMBLE MODEL INFERENCE - 4 MODELS")
+    print("="*70)
+    print("Models:")
+    for name, path in config['model_paths'].items():
+        print(f"  {name}: {path}")
+    print(f"Weights: {config['weights']}")
+    print("="*70)
+    
+    # Check if files exist
+    for name, path in config['model_paths'].items():
+        if not os.path.exists(path):
+            print(f"Error: Model file not found: {path}")
+            return
+    
+    if not os.path.exists(config['test_csv']):
+        print(f"Error: Test CSV not found: {config['test_csv']}")
+        return
+    
+    if not os.path.exists(config['test_img_dir']):
+        print(f"Error: Test images not found: {config['test_img_dir']}")
+        return
+    
+    # Load all models
+    models = load_all_models(config)
+    
+    # Prepare transforms
+    transforms_dict = {
+        'ycbcr': get_ycbcr_transforms(),
+        'swin': get_swin_transforms(),
+        'pvt': get_pvt_transforms()
+    }
+    
+    # Create dataset
+    dataset = EnsembleDataset(config['test_csv'], config['test_img_dir'])
+    
+    # Generate predictions
+    all_predictions = []
+    all_image_names = []
+    all_ensemble_probs = []
+    
+    print("\nGenerating ensemble predictions...")
+    for i in tqdm(range(len(dataset)), desc="Processing images"):
+        batch_data = dataset[i]
+        image_name = batch_data['name']
+        
+        # Get predictions from all models
+        model_probs = ensemble_predict(models, batch_data, transforms_dict)
+        
+        # Weighted average ensemble
+        weighted_probs = np.zeros_like(model_probs[0])
+        for j, weight in enumerate(config['weights']):
+            weighted_probs += model_probs[j] * weight
+        
+        # Get final prediction
+        final_pred = np.argmax(weighted_probs, axis=1)[0]
+        
+        all_predictions.append(final_pred)
+        all_image_names.append(image_name)
+        all_ensemble_probs.append(weighted_probs[0])
+    
+    # Create submission file
+    submission_df = pd.DataFrame({
+        'id_code': all_image_names,
+        'diagnosis': all_predictions
+    })
+    
+    # Sort by id_code for consistency
+    submission_df = submission_df.sort_values('id_code')
+    submission_df.to_csv(config['output_file'], index=False)
+    
+    print(f"\nEnsemble submission saved: {config['output_file']}")
+    print(f"Total predictions: {len(submission_df)}")
+    
+    # Print prediction distribution
+    print("\nPrediction distribution:")
+    for i in range(5):
+        count = (submission_df['diagnosis'] == i).sum()
+        percentage = count / len(submission_df) * 100
+        print(f"  Class {i}: {count} images ({percentage:.1f}%)")
+    
+    return submission_df
+
+if __name__ == "__main__":
+    # Set random seeds for reproducibility
+    torch.manual_seed(42)
+    np.random.seed(42)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+    
+    # Run ensemble inference
+    submission_df = main()
